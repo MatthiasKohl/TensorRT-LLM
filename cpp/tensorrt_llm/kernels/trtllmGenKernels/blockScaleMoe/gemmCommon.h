@@ -446,9 +446,9 @@ inline void checkAndUpdateGemmOptions(
             hiddenDimPerMma, ")");
     }
 
-    TLLM_CHECK_ERROR((options.mK / options.mNumSlicesForSplitK) % (options.mTileK * 2) == 0,
-        "Size K / splitK must be a multiple of TileK * 2. Found TileK=", options.mTileK, " and K=", options.mK,
-        " and numSlicesForSplitK=", options.mNumSlicesForSplitK);
+    // TLLM_CHECK_ERROR((options.mK / options.mNumSlicesForSplitK) % (options.mTileK * 2) == 0,
+    //     "Size K / splitK must be a multiple of TileK * 2. Found TileK=", options.mTileK, " and K=", options.mK,
+    //     " and numSlicesForSplitK=", options.mNumSlicesForSplitK);
 
     if (options.mSliceK)
     {

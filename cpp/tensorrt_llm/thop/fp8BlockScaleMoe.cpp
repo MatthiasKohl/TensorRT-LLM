@@ -119,7 +119,8 @@ torch::Tensor fp8_block_scale_moe_runner(torch::Tensor const& routing_logits, to
     at::Tensor gemm2_output = at::detail::empty_cuda(
         {max_num_padded_tokens, args.hidden_size}, at::ScalarType::BFloat16, hidden_states.device(), std::nullopt);
 
-    int32_t max_num_ctas = (args.num_tokens + tileN - 1) / tileN * args.num_experts;
+    int32_t max_num_ctas = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::getMaxNumCtas(
+        args.num_tokens, args.num_experts, tileN);
     at::Tensor cta_idx_xy_to_batch_idx
         = at::detail::empty_cuda({max_num_ctas}, at::ScalarType::Int, routing_logits.device(), std::nullopt);
     at::Tensor cta_idx_xy_to_mn_limit

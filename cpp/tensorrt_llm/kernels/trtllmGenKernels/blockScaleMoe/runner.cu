@@ -71,6 +71,9 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t num_tokens, int
         TLLM_CHECK_WITH_INFO(selectedIndex.size() == 1, "Multiple kernels found for the given element type");
         auto const& kernelInfo = PermuteGemm1::gemmList[*selectedIndex.begin()];
         int32_t tileN = kernelInfo.tileN;
+        // FIXME remove this once we fix data dependency in the kernel
+        auto maxNumCtas = Routing::getMaxNumCtas(num_tokens, num_experts, tileN);
+        cudaMemsetAsync(cta_idx_xy_to_batch_idx, 0, maxNumCtas * sizeof(int32_t), stream);
 
         moe::dev::routing::Data routingData;
         routingData.mDtypeExpW = tg::Dtype::Bfloat16;
@@ -126,6 +129,9 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t num_tokens, int
         TLLM_CHECK_WITH_INFO(selectedIndex.size() == 1, "Multiple kernels found for the given element type");
         auto const& kernelInfo = PermuteGemm1::gemmList[*selectedIndex.begin()];
         int32_t tileN = kernelInfo.tileN;
+        // FIXME remove this once we fix data dependency in the kernel
+        auto maxNumCtas = Routing::getMaxNumCtas(num_tokens, num_experts, tileN);
+        cudaMemsetAsync(cta_idx_xy_to_batch_idx, 0, maxNumCtas * sizeof(int32_t), stream);
 
         moe::dev::routingLlama4::Data routingData;
         routingData.mDtypeExpW = tg::Dtype::Bfloat16;
@@ -259,19 +265,29 @@ void Runner::run(void* permuted_hidden_state, void* permuted_hidden_state_scale,
     int32_t* ptr_total_num_padded_tokens, int32_t* ptr_cta_idx_xy_to_batch_idx, int32_t* ptr_cta_idx_xy_to_mn_limit,
     bool use_deep_seek_fp8, cudaStream_t stream)
 {
-    std::vector<int32_t> selectedIndex;
+    std::vector<int32_t> selectedIndices;
     for (size_t ii = 0; ii < gemmList.size(); ii++)
     {
         auto gemmInfo = gemmList[ii];
         if (gemmInfo.dtypeElt == mDtypeElt && gemmInfo.dtypeC == mOutputDtype
             && gemmInfo.useDeepSeekFp8 == use_deep_seek_fp8)
         {
-            selectedIndex.push_back(ii);
+            selectedIndices.push_back(ii);
         }
     }
-    TLLM_CHECK_WITH_INFO(selectedIndex.size() != 0, "No kernel found for the given element and output types");
-    TLLM_CHECK_WITH_INFO(selectedIndex.size() == 1, "Multiple kernels found for the given element and output types");
-    auto const& kernelInfo = gemmList[*selectedIndex.begin()];
+    TLLM_CHECK_WITH_INFO(selectedIndices.size() != 0, "No kernel found for the given element and output types");
+    int selectedIndex = *selectedIndices.begin();
+    // FIXME this is a WAR to select the correct kernel for the given intermediate size in DS TP8EP1
+    if (intermediate_size == 256) {
+        for (auto ii : selectedIndices) {
+            auto const& kernelInfo = gemmList[ii];
+            if (kernelInfo.tileK == 256) {
+                selectedIndex = ii;
+                break;
+            }
+        }
+    }
+    auto const& kernelInfo = gemmList[selectedIndex];
 
     gemmCommon::MyOptions options;
     options.mTopK = top_k;
@@ -284,7 +300,7 @@ void Runner::run(void* permuted_hidden_state, void* permuted_hidden_state_scale,
     options.mK = intermediate_size;
     options.mClusterDimX = 1;
     options.mClusterDimY = 1;
-    options.mClusterDimZ = 1;
+    options.mClusterDimZ = kernelInfo.numSlicesForSplitK;
     options.mAllReduceAlgo = gemmCommon::gemm::AllReduceAlgo::None;
     options.mSplitK = gemmCommon::gemm::SplitK::None;
     options.mPtrNumNonExitingCtas = ptr_num_non_exiting_ctas;

@@ -33,12 +33,17 @@ namespace trtllmGenFp8BlockScaleMoe
 namespace Routing
 {
 inline int32_t getMaxPermutedPaddedCount(
-    const int32_t numTokens, const int32_t expertsPerToken, const int32_t numExperts, const int32_t padding)
+    int32_t numTokens, int32_t expertsPerToken, int32_t numExperts, int32_t padding)
 {
-
-    const int32_t expandedRowCount = numTokens * expertsPerToken;
-    const int32_t maxPaddingRequired = (padding - 1) * numExperts;
+    auto const expandedRowCount = numTokens * expertsPerToken;
+    auto const maxPaddingRequired = (padding - 1) * numExperts;
     return expandedRowCount + maxPaddingRequired;
+}
+
+inline int32_t getMaxNumCtas(
+    int32_t numTokens, int32_t numExperts, int32_t padding)
+{
+    return (numTokens + padding - 1) / padding * numExperts;
 }
 
 class Runner

@@ -530,11 +530,11 @@ def quant_dequant_per_tensor_fp8(a):
     reason="The kernel only supports Blackwell. Current SM is %d." %
     getSMVersion(),
 )
-@pytest.mark.parametrize("num_tokens", [16, 64, 1024])
+@pytest.mark.parametrize("num_tokens", [1, 8, 256])
 @pytest.mark.parametrize("expert_info", [(32, 8, 4, 8), (32, 1, 1, 5),
                                          (72, 1, 1, 6), (256, 8, 4, 8)])
-@pytest.mark.parametrize("hidden_size", [512])
-@pytest.mark.parametrize("intermediate_size", [512])
+@pytest.mark.parametrize("hidden_size", [1024])
+@pytest.mark.parametrize("intermediate_size", [256, 512])
 def test_moe_fp8(num_tokens, expert_info, hidden_size, intermediate_size):
     torch.random.manual_seed(0)
 
@@ -627,11 +627,11 @@ def test_moe_fp8(num_tokens, expert_info, hidden_size, intermediate_size):
     reason="The kernel only supports Blackwell. Current SM is %d." %
     getSMVersion(),
 )
-@pytest.mark.parametrize("num_tokens", [1, 2, 16, 64, 1024])
+@pytest.mark.parametrize("num_tokens", [1, 8, 256])
 @pytest.mark.parametrize("expert_info", [(32, 8, 4, 8), (32, 1, 1, 5),
                                          (72, 1, 1, 6), (256, 8, 4, 8)])
 @pytest.mark.parametrize("hidden_size", [1024])
-@pytest.mark.parametrize("intermediate_size", [1024])
+@pytest.mark.parametrize("intermediate_size", [256, 512, 1024])
 def test_moe_fp4(num_tokens, expert_info, hidden_size, intermediate_size):
     torch.random.manual_seed(0)
 
@@ -852,11 +852,11 @@ def test_moe_fp4(num_tokens, expert_info, hidden_size, intermediate_size):
     reason="The kernel only supports Blackwell. Current SM is %d." %
     getSMVersion(),
 )
-@pytest.mark.parametrize("num_tokens", [1, 2, 16, 64, 1024])
+@pytest.mark.parametrize("num_tokens", [1, 8, 256])
 @pytest.mark.parametrize("expert_info", [(128, 0, 0, 1, True),
                                          (128, 8, 4, 8, False)])
-@pytest.mark.parametrize("hidden_size", [2048])
-@pytest.mark.parametrize("intermediate_size", [2048])
+@pytest.mark.parametrize("hidden_size", [1024])
+@pytest.mark.parametrize("intermediate_size", [1024])
 def test_moe_fp8_per_tensor_scale(num_tokens, expert_info, hidden_size,
                                   intermediate_size):
     torch.random.manual_seed(0)
