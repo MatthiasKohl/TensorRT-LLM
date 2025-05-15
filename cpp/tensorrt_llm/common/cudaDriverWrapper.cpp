@@ -90,6 +90,8 @@ CUDADriverWrapper::CUDADriverWrapper()
     *reinterpret_cast<void**>(&_cuMemcpyDtoH) = load_sym(handle, "cuMemcpyDtoH_v2");
     *reinterpret_cast<void**>(&_cuDeviceGetAttribute) = load_sym(handle, "cuDeviceGetAttribute");
     *reinterpret_cast<void**>(&_cuOccupancyMaxActiveClusters) = load_sym(handle, "cuOccupancyMaxActiveClusters");
+    *reinterpret_cast<void**>(&_cuFuncGetParamInfo) = load_sym(handle, "cuFuncGetParamInfo");
+    *reinterpret_cast<void**>(&_cuFuncGetAttribute) = load_sym(handle, "cuFuncGetAttribute");
 }
 
 CUDADriverWrapper::~CUDADriverWrapper()
@@ -178,41 +180,103 @@ CUresult CUDADriverWrapper::cuLaunchKernel(CUfunction f, unsigned int gridDimX, 
 
 namespace
 {
-std::string stringify_launch_config(CUlaunchConfig const& config)
+std::string stringify_launch_config(CUlaunchConfig const& config, CUfunction f, void** kernelParams, void** extra, 
+    CUDADriverWrapper const& wrapper)
 {
     std::stringstream ss;
 
-    // Grid dimensions (Driver API uses separate fields)
-    ss << "Grid Dimensions: (" << config.gridDimX << ", " << config.gridDimY << ", " << config.gridDimZ << ")\n";
+    // Grid dimensions
+    ss << "Launch Configuration:\n";
+    ss << "  Grid Dimensions: (" << config.gridDimX << ", " << config.gridDimY << ", " << config.gridDimZ << ")\n";
 
     // Block dimensions
-    ss << "Block Dimensions: (" << config.blockDimX << ", " << config.blockDimY << ", " << config.blockDimZ << ")\n";
+    ss << "  Block Dimensions: (" << config.blockDimX << ", " << config.blockDimY << ", " << config.blockDimZ << ")\n";
 
-    // Shared memory and stream (Driver API uses hStream)
-    ss << "Shared Memory: " << config.sharedMemBytes << " bytes\n";
-    ss << "Stream: " << (config.hStream ? "Custom" : "Default") << " (0x" << std::hex
-       << reinterpret_cast<uintptr_t>(config.hStream) << ")\n";
+    // Calculate total threads per block
+    unsigned int threadsPerBlock = config.blockDimX * config.blockDimY * config.blockDimZ;
+    
+    // Get max threads per block
+    int maxThreadsPerBlock = 0;
+    wrapper.cuFuncGetAttribute(&maxThreadsPerBlock, CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK, f);
+    ss << "  Threads Per Block: " << threadsPerBlock << " (Max allowed: " << maxThreadsPerBlock << ")\n";
 
-    // Attributes (Driver API uses value instead of val)
-    ss << "Attributes (" << config.numAttrs << "):\n";
+    // Get number of registers
+    int numRegs = 0;
+    wrapper.cuFuncGetAttribute(&numRegs, CU_FUNC_ATTRIBUTE_NUM_REGS, f);
+    ss << "  Registers Per Thread: " << numRegs << "\n";
+
+    // Shared memory
+    int maxSharedSize = 0;
+    wrapper.cuFuncGetAttribute(&maxSharedSize, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, f);
+    ss << "  Shared Memory: " << config.sharedMemBytes << " bytes (Max allowed: " << maxSharedSize << " bytes)\n";
+
+    // Stream info
+    ss << "  Stream: 0x" << std::hex << reinterpret_cast<uintptr_t>(config.hStream) << std::dec << "\n";
+
+    // PDL (Param vs Extra) usage
+    ss << "  Parameter Mode: " << (extra != nullptr ? "Extra (PDL)" : "KernelParams") << "\n";
+
+    // Parameter count validation using cuFuncGetParamInfo
+    size_t paramOffset = 0, paramSize = 0;
+    CUresult paramInfoResult = wrapper.cuFuncGetParamInfo(f, 0, &paramOffset, &paramSize);
+    if (paramInfoResult == CUDA_SUCCESS)
+    {
+        // Try to get info for second parameter - if it succeeds, there's more than one parameter
+        size_t param2Offset = 0, param2Size = 0;
+        if (wrapper.cuFuncGetParamInfo(f, 1, &param2Offset, &param2Size) == CUDA_SUCCESS)
+        {
+            ss << "  WARNING: Function has multiple parameters (expected single parameter)\n";
+        }
+        else
+        {
+            ss << "  Parameter validation: OK (single parameter)\n";
+        }
+    }
+    else
+    {
+        ss << "  Parameter validation: Failed to get parameter info\n";
+    }
+
+    // Cluster dimensions
+    bool hasClusterDim = false;
     for (uint i = 0; i < config.numAttrs; ++i)
     {
         CUlaunchAttribute const& attr = config.attrs[i];
-        ss << "  [" << i << "] ";
-
-        switch (attr.id)
+        if (attr.id == CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION)
         {
-        case CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION:
-            ss << "Cluster Dimension: (" << attr.value.clusterDim.x << ", " << attr.value.clusterDim.y << ", "
-               << attr.value.clusterDim.z << ")";
+            hasClusterDim = true;
+            ss << "  Cluster Dimensions: (" << attr.value.clusterDim.x << ", " 
+               << attr.value.clusterDim.y << ", " << attr.value.clusterDim.z << ")\n";
             break;
-
-        case CU_LAUNCH_ATTRIBUTE_PRIORITY: ss << "Priority: " << attr.value.priority; break;
-
-        // Handle other Driver API attributes here
-        default: ss << "Unknown Attribute (ID=" << attr.id << ")"; break;
         }
-        ss << "\n";
+    }
+    if (!hasClusterDim)
+    {
+        ss << "  Cluster Dimensions: Not specified\n";
+    }
+
+    // Other attributes
+    if (config.numAttrs > 0)
+    {
+        ss << "  Additional Attributes:\n";
+        for (uint i = 0; i < config.numAttrs; ++i)
+        {
+            CUlaunchAttribute const& attr = config.attrs[i];
+            if (attr.id != CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION)  // Skip cluster dim as it's already printed
+            {
+                ss << "    [" << i << "] ";
+                switch (attr.id)
+                {
+                case CU_LAUNCH_ATTRIBUTE_PRIORITY: 
+                    ss << "Priority: " << attr.value.priority;
+                    break;
+                default: 
+                    ss << "Unknown Attribute (ID=" << attr.id << ")";
+                    break;
+                }
+                ss << "\n";
+            }
+        }
     }
 
     return ss.str();
@@ -222,10 +286,37 @@ std::string stringify_launch_config(CUlaunchConfig const& config)
 CUresult CUDADriverWrapper::cuLaunchKernelEx(
     CUlaunchConfig const* config, CUfunction f, void** kernelParams, void** extra) const
 {
+    // Validate configuration
+    int maxThreadsPerBlock = 0;
+    CUresult result = cuFuncGetAttribute(&maxThreadsPerBlock, CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK, f);
+    if (result != CUDA_SUCCESS) return result;
 
-    TLLM_LOG_DEBUG("Launch config: %s", stringify_launch_config(*config).c_str());
+    unsigned int threadsPerBlock = config->blockDimX * config->blockDimY * config->blockDimZ;
+    if (threadsPerBlock > static_cast<unsigned int>(maxThreadsPerBlock))
+    {
+        TLLM_LOG_ERROR("Threads per block (%u) exceeds maximum allowed (%d)", 
+            threadsPerBlock, maxThreadsPerBlock);
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+
+    int maxSharedSize = 0;
+    result = cuFuncGetAttribute(&maxSharedSize, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, f);
+    if (result != CUDA_SUCCESS) return result;
+
+    if (config->sharedMemBytes > static_cast<unsigned int>(maxSharedSize))
+    {
+        TLLM_LOG_ERROR("Shared memory size (%u) exceeds maximum allowed (%d)", 
+            config->sharedMemBytes, maxSharedSize);
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+
+    // Print detailed launch configuration
+    TLLM_LOG_DEBUG("%s", stringify_launch_config(*config, f, kernelParams, extra, *this).c_str());
+
     TLLM_CHECK_DEBUG_WITH_INFO(
-        (extra != nullptr) != (kernelParams != nullptr), "Exactly one of 'extra' and 'kernelParams' should be set.");
+        (extra != nullptr) != (kernelParams != nullptr), 
+        "Exactly one of 'extra' and 'kernelParams' should be set.");
+
     return (*_cuLaunchKernelEx)(config, f, kernelParams, extra);
 }
 
@@ -252,6 +343,17 @@ CUresult CUDADriverWrapper::cuOccupancyMaxActiveClusters(
     int* maxActiveClusters, CUfunction f, CUlaunchConfig const* config) const
 {
     return (*_cuOccupancyMaxActiveClusters)(maxActiveClusters, f, config);
+}
+
+CUresult CUDADriverWrapper::cuFuncGetParamInfo(
+    CUfunction func, size_t paramIndex, size_t* paramOffset, size_t* paramSize) const
+{
+    return (*_cuFuncGetParamInfo)(func, paramIndex, paramOffset, paramSize);
+}
+
+CUresult CUDADriverWrapper::cuFuncGetAttribute(int* pi, CUfunction_attribute attrib, CUfunction hfunc) const
+{
+    return (*_cuFuncGetAttribute)(pi, attrib, hfunc);
 }
 
 } // namespace tensorrt_llm::common

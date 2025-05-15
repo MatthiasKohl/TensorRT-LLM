@@ -220,6 +220,7 @@ class MoEWeightLoadingMode(Enum):
 
 
 class FusedMoE(nn.Module):
+    _count = 0
     """
     Fused Mixture of Experts (MoE) Layer with performance tuning.
 
@@ -293,6 +294,9 @@ class FusedMoE(nn.Module):
         from ..distributed import AllReduce
 
         super().__init__()
+        self._id = FusedMoE._count
+        FusedMoE._count += 1
+        self._num_forward_calls = 0
         self.routing_method = routing_method
         self.num_experts = num_experts
         self.hidden_size = hidden_size
@@ -842,6 +846,13 @@ class FusedMoE(nn.Module):
         """
         cutlass_min_latency_mode has no effect when trtllm_gen backend is enabled.
         """
+        if self._id < 10 and self._num_forward_calls < 10:
+            print(f"Rank {self.cluster_rank}, EP rank {self.ep_rank}, TP rank {self.tp_rank}: FusedMoe layer {self._id}, fwd {self._num_forward_calls}")
+        if self._id == 0 and self._num_forward_calls == 4:
+            torch.cuda.cudart().cudaProfilerStart()
+        if self._id == 0 and self._num_forward_calls == 9:
+            torch.cuda.cudart().cudaProfilerStop()
+        self._num_forward_calls += 1
         if self.is_cutlass():
             return self.forward_cutlass(x, router_logits,
                                         cutlass_min_latency_mode, output_dtype,

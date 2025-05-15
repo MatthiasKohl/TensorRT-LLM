@@ -795,8 +795,68 @@ void launchGemmFromData(GemmInfo const& kernelInfo, MyOptions const& options, Ba
     launch_config.attrs = launch_attribute;
     launch_config.numAttrs = 3;
 
-    // std::cout << "kernelInfo.data: " << kernelInfo.data << std::endl;
-    // std::cout << "kernelInfo.functionName: " << kernelInfo.functionName << std::endl;
+    std::cout << "kernelInfo.data: " << kernelInfo.data << std::endl;
+    std::cout << "kernelInfo.functionName: " << kernelInfo.functionName << std::endl;
+
+    // Validate kernel parameters
+    size_t paramOffset = 0, paramSize = 0;
+    CUresult paramInfoResult = cuDriver->cuFuncGetParamInfo(cuFunction, 0, &paramOffset, &paramSize);
+    if (paramInfoResult == CUDA_SUCCESS)
+    {
+        // Try to get info for second parameter - if it succeeds, there's more than one parameter
+        size_t param2Offset = 0, param2Size = 0;
+        if (cuDriver->cuFuncGetParamInfo(cuFunction, 1, &param2Offset, &param2Size) == CUDA_SUCCESS)
+        {
+            TLLM_LOG_WARNING("Function has multiple parameters (expected single parameter)");
+        }
+        else
+        {
+            TLLM_LOG_DEBUG("Parameter validation: OK (single parameter)");
+            // Validate parameter size matches our expected struct size
+            TLLM_CHECK_WITH_INFO(paramSize == sizeof(params), 
+                "Parameter size mismatch: kernel expects %zu bytes but struct is %zu bytes", 
+                paramSize, sizeof(params));
+            TLLM_CHECK_WITH_INFO(kernelInfo.paramsStructSize == sizeof(params), "Alignment issue detected");
+        }
+    }
+
+    // Get kernel attributes
+    int maxThreadsPerBlock = 0;
+    TLLM_CU_CHECK(cuDriver->cuFuncGetAttribute(&maxThreadsPerBlock, CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK, cuFunction));
+    
+    int maxSharedSize = 0;
+    TLLM_CU_CHECK(cuDriver->cuFuncGetAttribute(&maxSharedSize, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, cuFunction));
+    
+    int numRegs = 0;
+    TLLM_CU_CHECK(cuDriver->cuFuncGetAttribute(&numRegs, CU_FUNC_ATTRIBUTE_NUM_REGS, cuFunction));
+
+    // Print launch configuration
+    std::stringstream ss;
+    ss << "Launch Configuration:\n";
+    ss << "  Grid Dimensions: (" << batchedGemmData.mNumCtaX << ", " << batchedGemmData.mNumCtaY << ", " << batchedGemmData.mNumCtaZ << ")\n";
+    ss << "  Block Dimensions: (" << kernelInfo.threadsPerCTA << ", 1, 1)\n";
+    ss << "  Cluster Dimensions: (" << batchedGemmData.mClusterDimX << ", " << batchedGemmData.mClusterDimY << ", " << batchedGemmData.mClusterDimZ << ")\n";
+    ss << "  Threads Per Block: " << kernelInfo.threadsPerCTA << " (Max allowed: " << maxThreadsPerBlock << ")\n";
+    ss << "  Registers Per Thread: " << numRegs << "\n";
+    ss << "  Shared Memory: " << kernelInfo.sharedMemSize << " bytes (Max allowed: " << maxSharedSize << " bytes)\n";
+    ss << "  Stream: 0x" << std::hex << reinterpret_cast<uintptr_t>(stream) << std::dec << "\n";
+    ss << "  PDL Enabled: " << (usePDL ? "Yes" : "No") << "\n";
+    TLLM_LOG_DEBUG("%s", ss.str().c_str());
+
+    // Validate configuration
+    if (kernelInfo.threadsPerCTA > static_cast<unsigned int>(maxThreadsPerBlock))
+    {
+        TLLM_LOG_ERROR("Threads per block (%u) exceeds maximum allowed (%d)", 
+            kernelInfo.threadsPerCTA, maxThreadsPerBlock);
+        return;
+    }
+
+    if (kernelInfo.sharedMemSize > static_cast<unsigned int>(maxSharedSize))
+    {
+        TLLM_LOG_ERROR("Shared memory size (%u) exceeds maximum allowed (%d)", 
+            kernelInfo.sharedMemSize, maxSharedSize);
+        return;
+    }
 
     TLLM_CHECK_WITH_INFO(kernelInfo.paramsStructSize == sizeof(params), "Alignment issue detected");
     void* kernelParamsList[] = {&params};

@@ -87,6 +87,10 @@ public:
 
     CUresult cuOccupancyMaxActiveClusters(int* maxActiveClusters, CUfunction f, CUlaunchConfig const* config) const;
 
+    CUresult cuFuncGetParamInfo(CUfunction func, size_t paramIndex, size_t* paramOffset, size_t* paramSize) const;
+
+    CUresult cuFuncGetAttribute(int* pi, CUfunction_attribute attrib, CUfunction hfunc) const;
+
 private:
     void* handle;
     CUDADriverWrapper();
@@ -117,6 +121,8 @@ private:
     CUresult (*_cuMemcpyDtoH)(void* dstHost, CUdeviceptr srcDevice, size_t ByteCount);
     CUresult (*_cuDeviceGetAttribute)(int*, CUdevice_attribute attrib, CUdevice dev);
     CUresult (*_cuOccupancyMaxActiveClusters)(int*, CUfunction f, CUlaunchConfig const* config);
+    CUresult (*_cuFuncGetParamInfo)(CUfunction func, size_t paramIndex, size_t* paramOffset, size_t* paramSize);
+    CUresult (*_cuFuncGetAttribute)(int* pi, CUfunction_attribute attrib, CUfunction hfunc);
 };
 
 template <typename T>
