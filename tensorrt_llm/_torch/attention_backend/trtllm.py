@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import List, Optional
 
 import torch
 
@@ -1003,3 +1003,199 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             beam_width,
             self.wrapper.quant_mode,
         )
+
+    def compute_attention_stats(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        metadata: TrtllmAttentionMetadata,
+        attention_input_type: AttentionInputType = AttentionInputType.mixed,
+        latent_cache: Optional[torch.Tensor] = None,
+        q_pe: Optional[torch.Tensor] = None,
+        mla_context_paged_kv: Optional[torch.Tensor] = None,
+        mla_context_kv_cache_block_offsets: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Compute local softmax statistics for context parallelism.
+        This is Phase 1 of the two-phase attention computation.
+
+        Args:
+            q: Query tensor
+            k: Key tensor (optional)
+            v: Value tensor (optional)
+            metadata: Attention metadata
+            attention_input_type: Type of attention input
+            latent_cache: Latent cache tensor (optional)
+            q_pe: Query positional embedding tensor (optional)
+            mla_context_paged_kv: Paged KV cache for MLA context (optional)
+            mla_context_kv_cache_block_offsets: Block offsets for paged KV cache (optional)
+
+        Returns:
+            torch.Tensor: Local softmax statistics
+        """
+        # Call the TRTLLM op to compute local softmax statistics
+        local_stats = torch.ops.trtllm.attention_compute_stats(
+            q,
+            k,
+            v,
+            None,  # out_dtype not needed for stats computation
+            metadata.workspace,
+            metadata.kv_lens_cuda_runtime,
+            metadata.kv_lens_runtime,
+            metadata.prompt_lens_cuda_runtime,
+            metadata.prompt_lens_cpu_runtime,
+            metadata.host_request_types_runtime,
+            metadata.kv_cache_block_offsets,
+            metadata.host_kv_cache_block_offsets,
+            metadata.host_kv_cache_pool_pointers,
+            metadata.host_kv_cache_pool_mapping,
+            metadata.cache_indirection,
+            self.kv_scale_orig_quant,
+            self.kv_scale_quant_orig,
+            None,  # out_scale not needed for stats computation
+            self.rotary_inv_freq,
+            self.rotary_cos_sin,
+            latent_cache,
+            q_pe,
+            metadata.block_ids_per_seq,
+            k is None,  # is_fused_qkv
+            True,  # update_kv_cache
+            self.predicted_tokens_per_seq,
+            self.get_local_layer_idx(metadata),
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_size,
+            metadata.tokens_per_block,
+            metadata.max_num_requests,
+            metadata.max_context_length,
+            metadata.attention_window_size,
+            metadata.sink_token_length,
+            metadata.beam_width,
+            int(AttentionMaskType.causal),  # mask_type
+            self.wrapper.quant_mode,
+            self.q_scaling,
+            self.position_embedding_type,
+            self.rotary_embedding_dim,
+            self.rotary_embedding_base,
+            self.rotary_embedding_scale_type,
+            self.rotary_embedding_scale,
+            self.rotary_embedding_short_m_scale,
+            self.rotary_embedding_long_m_scale,
+            self.rotary_embedding_max_positions,
+            self.rotary_embedding_original_max_positions,
+            metadata.use_paged_context_fmha,
+            int(attention_input_type),
+            self.is_mla_enable,
+            self.q_lora_rank,
+            self.kv_lora_rank,
+            self.qk_nope_head_dim,
+            self.qk_rope_head_dim,
+            self.v_head_dim,
+            self.mrope_rotary_cos_sin,
+            self.mrope_position_deltas,
+            mla_context_paged_kv,
+            mla_context_kv_cache_block_offsets,
+        )
+        return local_stats
+
+    def compute_attention_output(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        gathered_stats: List[torch.Tensor],
+        metadata: TrtllmAttentionMetadata,
+        attention_input_type: AttentionInputType = AttentionInputType.mixed,
+        latent_cache: Optional[torch.Tensor] = None,
+        q_pe: Optional[torch.Tensor] = None,
+        mla_context_paged_kv: Optional[torch.Tensor] = None,
+        mla_context_kv_cache_block_offsets: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Compute final attention output using gathered statistics.
+        This is Phase 2 of the two-phase attention computation.
+
+        Args:
+            q: Query tensor
+            k: Key tensor (optional)
+            v: Value tensor (optional)
+            gathered_stats: List of gathered softmax statistics from all context parallel ranks
+            metadata: Attention metadata
+            attention_input_type: Type of attention input
+            latent_cache: Latent cache tensor (optional)
+            q_pe: Query positional embedding tensor (optional)
+            mla_context_paged_kv: Paged KV cache for MLA context (optional)
+            mla_context_kv_cache_block_offsets: Block offsets for paged KV cache (optional)
+
+        Returns:
+            torch.Tensor: Final attention output
+        """
+        # Concatenate gathered statistics
+        all_stats = torch.cat(gathered_stats, dim=0)
+
+        # Call the TRTLLM op to compute final attention output
+        output = torch.ops.trtllm.attention_compute_output(
+            q,
+            k,
+            v,
+            all_stats,
+            None,  # out_dtype
+            metadata.workspace,
+            metadata.kv_lens_cuda_runtime,
+            metadata.kv_lens_runtime,
+            metadata.prompt_lens_cuda_runtime,
+            metadata.prompt_lens_cpu_runtime,
+            metadata.host_request_types_runtime,
+            metadata.kv_cache_block_offsets,
+            metadata.host_kv_cache_block_offsets,
+            metadata.host_kv_cache_pool_pointers,
+            metadata.host_kv_cache_pool_mapping,
+            metadata.cache_indirection,
+            self.kv_scale_orig_quant,
+            self.kv_scale_quant_orig,
+            None,  # out_scale
+            self.rotary_inv_freq,
+            self.rotary_cos_sin,
+            latent_cache,
+            q_pe,
+            metadata.block_ids_per_seq,
+            k is None,  # is_fused_qkv
+            True,  # update_kv_cache
+            self.predicted_tokens_per_seq,
+            self.get_local_layer_idx(metadata),
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_size,
+            metadata.tokens_per_block,
+            metadata.max_num_requests,
+            metadata.max_context_length,
+            metadata.attention_window_size,
+            metadata.sink_token_length,
+            metadata.beam_width,
+            int(AttentionMaskType.causal),  # mask_type
+            self.wrapper.quant_mode,
+            self.q_scaling,
+            self.position_embedding_type,
+            self.rotary_embedding_dim,
+            self.rotary_embedding_base,
+            self.rotary_embedding_scale_type,
+            self.rotary_embedding_scale,
+            self.rotary_embedding_short_m_scale,
+            self.rotary_embedding_long_m_scale,
+            self.rotary_embedding_max_positions,
+            self.rotary_embedding_original_max_positions,
+            metadata.use_paged_context_fmha,
+            int(attention_input_type),
+            self.is_mla_enable,
+            self.q_lora_rank,
+            self.kv_lora_rank,
+            self.qk_nope_head_dim,
+            self.qk_rope_head_dim,
+            self.v_head_dim,
+            self.mrope_rotary_cos_sin,
+            self.mrope_position_deltas,
+            mla_context_paged_kv,
+            mla_context_kv_cache_block_offsets,
+        )
+        return output

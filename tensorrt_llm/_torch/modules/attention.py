@@ -337,7 +337,9 @@ class MLA(nn.Module):
         self.q_lora_rank = q_lora_rank
         self.kv_lora_rank = kv_lora_rank
         self.predicted_tokens_per_seq = predicted_tokens_per_seq
-        self.max_position_embeddings = max_position_embeddings
+        config = config or ModelConfig()
+        self.mapping = config.mapping
+        self.max_position_embeddings = max_position_embeddings // self.mapping.attn_cp_size  # Adjust max positions for context parallelism
         self.pos_embd_params = pos_embd_params
         self.dense_bias = dense_bias
         if dense_bias is None:
@@ -358,6 +360,7 @@ class MLA(nn.Module):
         if config.mapping.enable_attention_dp:
             tp_size = 1
 
+        # TODO check if this is correct w.r.t cp size
         mapping = Mapping(
             world_size=tp_size * pp_size,
             tp_size=tp_size,
@@ -730,18 +733,46 @@ class MLA(nn.Module):
         # May concat q(including q_pe), k + k_pe, v together
         q, k, v = self._maybe_concat_qkv(q, k, v)
 
-        # out_scale = getattr(self.o_proj, "inv_input_scale", None)
-        out_scale = None  # Currently we use BF16 MHA for context phase
+        # Split attention computation into two phases for context parallelism
+        if self.mapping.attn_cp_size > 1:
+            # Phase 1: Compute local softmax statistics
+            local_stats = self.mha.compute_attention_stats(
+                q,
+                k,
+                v,
+                attn_metadata,
+                attention_input_type=AttentionInputType.context_only,
+                latent_cache=latent_cache)
 
-        attn_output = self.mha.forward(
-            q,
-            k,
-            v,
-            attn_metadata,
-            attention_input_type=AttentionInputType.context_only,
-            latent_cache=latent_cache,
-            out_scale=out_scale,
-        )
+            # All-gather softmax statistics across context parallel group
+            gathered_stats = [
+                torch.empty_like(local_stats)
+                for _ in range(self.mapping.attn_cp_size)
+            ]
+            torch.distributed.all_gather(gathered_stats,
+                                         local_stats,
+                                         group=self.mapping.cp_group)
+
+            # Phase 2: Compute final attention output using gathered statistics
+            attn_output = self.mha.compute_attention_output(
+                q,
+                k,
+                v,
+                gathered_stats,
+                attn_metadata,
+                attention_input_type=AttentionInputType.context_only,
+                latent_cache=latent_cache)
+        else:
+            # Regular single-phase attention when no context parallelism
+            attn_output = self.mha.forward(
+                q,
+                k,
+                v,
+                attn_metadata,
+                attention_input_type=AttentionInputType.context_only,
+                latent_cache=latent_cache,
+                out_scale=None  # Currently we use BF16 MHA for context phase
+            )
 
         return attn_output
 
@@ -850,21 +881,56 @@ class MLA(nn.Module):
             attn_metadata,
         )
 
-        # out_scale = getattr(self.o_proj, "inv_input_scale", None)
-        out_scale = None  # Currently we use BF16 MHA for context phase
+        # Split attention computation into two phases for context parallelism
+        if self.mapping.attn_cp_size > 1:
+            # Phase 1: Compute local softmax statistics
+            local_stats = self.mha.compute_attention_stats(
+                q,
+                None,
+                None,
+                attn_metadata,
+                attention_input_type=AttentionInputType.context_only,
+                latent_cache=None,
+                mla_context_paged_kv=full_kv,
+                mla_context_kv_cache_block_offsets=
+                mla_context_kv_cache_block_offsets)
 
-        attn_output = self.mha.forward(
-            q,
-            None,
-            None,
-            attn_metadata,
-            attention_input_type=AttentionInputType.context_only,
-            latent_cache=None,
-            out_scale=out_scale,
-            mla_context_paged_kv=full_kv,
-            mla_context_kv_cache_block_offsets=
-            mla_context_kv_cache_block_offsets,
-        )
+            # All-gather softmax statistics across context parallel group
+            gathered_stats = [
+                torch.empty_like(local_stats)
+                for _ in range(self.mapping.attn_cp_size)
+            ]
+            torch.distributed.all_gather(gathered_stats,
+                                         local_stats,
+                                         group=self.mapping.cp_group)
+
+            # Phase 2: Compute final attention output using gathered statistics
+            attn_output = self.mha.compute_attention_output(
+                q,
+                None,
+                None,
+                gathered_stats,
+                attn_metadata,
+                attention_input_type=AttentionInputType.context_only,
+                latent_cache=None,
+                mla_context_paged_kv=full_kv,
+                mla_context_kv_cache_block_offsets=
+                mla_context_kv_cache_block_offsets)
+        else:
+            # Regular single-phase attention when no context parallelism
+            attn_output = self.mha.forward(
+                q,
+                None,
+                None,
+                attn_metadata,
+                attention_input_type=AttentionInputType.context_only,
+                latent_cache=None,
+                out_scale=None,  # Currently we use BF16 MHA for context phase
+                mla_context_paged_kv=full_kv,
+                mla_context_kv_cache_block_offsets=
+                mla_context_kv_cache_block_offsets,
+            )
+
         return attn_output
 
     def forward_context(
@@ -941,19 +1007,50 @@ class MLA(nn.Module):
             self.num_heads * (self.kv_lora_rank + self.qk_rope_head_dim)
         ])
 
-        # out_scale = getattr(self.o_proj, "inv_input_scale", None)
-        out_scale = None  # Although we use FP8 MLA for generation phase, the output is still in BF16
+        # Split attention computation into two phases for context parallelism
+        if self.mapping.attn_cp_size > 1:
+            # Phase 1: Compute local softmax statistics
+            local_stats = self.mqa.compute_attention_stats(
+                fused_q,
+                None,
+                None,
+                attn_metadata,
+                attention_input_type=AttentionInputType.generation_only,
+                latent_cache=latent_cache,
+                q_pe=q_pe)
 
-        attn_out_latent = self.mqa.forward(
-            fused_q,
-            None,
-            None,
-            attn_metadata,
-            attention_input_type=AttentionInputType.generation_only,
-            out_scale=out_scale,
-            latent_cache=latent_cache,  # kvcache and k_pe
-            q_pe=q_pe,  # used by `invokeMLARopeGeneration`
-        )
+            # All-gather softmax statistics across context parallel group
+            gathered_stats = [
+                torch.empty_like(local_stats)
+                for _ in range(self.mapping.attn_cp_size)
+            ]
+            torch.distributed.all_gather(gathered_stats,
+                                         local_stats,
+                                         group=self.mapping.cp_group)
+
+            # Phase 2: Compute final attention output using gathered statistics
+            attn_out_latent = self.mqa.compute_attention_output(
+                fused_q,
+                None,
+                None,
+                gathered_stats,
+                attn_metadata,
+                attention_input_type=AttentionInputType.generation_only,
+                latent_cache=latent_cache,
+                q_pe=q_pe)
+        else:
+            # Regular single-phase attention when no context parallelism
+            attn_out_latent = self.mqa.forward(
+                fused_q,
+                None,
+                None,
+                attn_metadata,
+                attention_input_type=AttentionInputType.generation_only,
+                out_scale=None,
+                latent_cache=latent_cache,  # kvcache and k_pe
+                q_pe=q_pe,  # used by `invokeMLARopeGeneration`
+            )
+
         fused_q = None
 
         assert (attn_out_latent.shape[0] == q.shape[0] and

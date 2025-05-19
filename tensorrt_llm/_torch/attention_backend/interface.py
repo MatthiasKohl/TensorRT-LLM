@@ -547,6 +547,72 @@ class AttentionBackend(Generic[TMetadata]):
         """
         raise NotImplementedError
 
+    def compute_attention_stats(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        metadata: TMetadata,
+        attention_input_type: AttentionInputType = AttentionInputType.mixed,
+        latent_cache: Optional[torch.Tensor] = None,
+        q_pe: Optional[torch.Tensor] = None,
+        mla_context_paged_kv: Optional[torch.Tensor] = None,
+        mla_context_kv_cache_block_offsets: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Compute local softmax statistics for context parallelism.
+        This is Phase 1 of the two-phase attention computation.
+
+        Args:
+            q: Query tensor
+            k: Key tensor (optional)
+            v: Value tensor (optional)
+            metadata: Attention metadata
+            attention_input_type: Type of attention input
+            latent_cache: Latent cache tensor (optional)
+            q_pe: Query positional embedding tensor (optional)
+            mla_context_paged_kv: Paged KV cache for MLA context (optional)
+            mla_context_kv_cache_block_offsets: Block offsets for paged KV cache (optional)
+
+        Returns:
+            torch.Tensor: Local softmax statistics
+        """
+        raise NotImplementedError
+
+    def compute_attention_output(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        gathered_stats: List[torch.Tensor],
+        metadata: TMetadata,
+        attention_input_type: AttentionInputType = AttentionInputType.mixed,
+        latent_cache: Optional[torch.Tensor] = None,
+        q_pe: Optional[torch.Tensor] = None,
+        mla_context_paged_kv: Optional[torch.Tensor] = None,
+        mla_context_kv_cache_block_offsets: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Compute final attention output using gathered statistics.
+        This is Phase 2 of the two-phase attention computation.
+
+        Args:
+            q: Query tensor
+            k: Key tensor (optional)
+            v: Value tensor (optional)
+            gathered_stats: List of gathered softmax statistics from all context parallel ranks
+            metadata: Attention metadata
+            attention_input_type: Type of attention input
+            latent_cache: Latent cache tensor (optional)
+            q_pe: Query positional embedding tensor (optional)
+            mla_context_paged_kv: Paged KV cache for MLA context (optional)
+            mla_context_kv_cache_block_offsets: Block offsets for paged KV cache (optional)
+
+        Returns:
+            torch.Tensor: Final attention output
+        """
+        raise NotImplementedError
+
     @classmethod
     def support_fused_rope(cls) -> bool:
         return False

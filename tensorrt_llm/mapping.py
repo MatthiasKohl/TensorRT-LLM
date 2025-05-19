@@ -134,14 +134,17 @@ class Mapping(object):
             moe_cluster_size = 1
 
         if moe_tp_size == -1 and moe_ep_size == -1:
-            moe_tp_size = tp_size // moe_cluster_size
+            # Use tp_size * cp_size as basis for MOE parallelism
+            moe_tp_size = (tp_size * cp_size) // moe_cluster_size
             moe_ep_size = 1
 
         elif moe_tp_size == -1:
-            moe_tp_size = tp_size // (moe_ep_size * moe_cluster_size)
+            moe_tp_size = (tp_size * cp_size) // (moe_ep_size *
+                                                  moe_cluster_size)
 
         elif moe_ep_size == -1:
-            moe_ep_size = tp_size // (moe_tp_size * moe_cluster_size)
+            moe_ep_size = (tp_size * cp_size) // (moe_tp_size *
+                                                  moe_cluster_size)
 
         if attn_tp_size == -1 and attn_cp_size == -1:
             # fallback to ulysses
@@ -153,11 +156,6 @@ class Mapping(object):
 
         elif attn_cp_size == -1:
             attn_cp_size = cp_size * tp_size // attn_tp_size
-
-        if attn_cp_size != 1:
-            raise ValueError(
-                f"attn_cp_size must be 1 for now, but got {attn_tp_size}, {attn_cp_size}."
-            )
 
         if auto_parallel:
             if tp_size != 1 or pp_size != 1 or tp_size != 1:
@@ -172,9 +170,9 @@ class Mapping(object):
 
         moe_tp_ep_size = moe_tp_size * moe_ep_size
         moe_tp_cluster_ep_size = moe_tp_ep_size * moe_cluster_size
-        if moe_tp_cluster_ep_size != tp_size:
+        if moe_tp_cluster_ep_size != tp_size * cp_size:  # Use tp_size * cp_size as basis
             raise ValueError(
-                f"tp_size must equal to moe_tp_size * moe_ep_size * moe_cluster_size, but got {tp_size} != {moe_tp_size} * {moe_ep_size} * {moe_cluster_size}"
+                f"tp_size * cp_size must equal to moe_tp_size * moe_ep_size * moe_cluster_size, but got {tp_size * cp_size} != {moe_tp_size} * {moe_ep_size} * {moe_cluster_size}"
             )
 
         attn_tp_cp_size = attn_tp_size * attn_cp_size
