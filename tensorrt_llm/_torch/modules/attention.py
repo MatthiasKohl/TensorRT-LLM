@@ -407,13 +407,15 @@ class MLA(nn.Module):
         config = config or ModelConfig()
         tp_size = config.mapping.tp_size
         pp_size = config.mapping.pp_size
+        kvp_size = config.mapping.kvp_size
         if config.mapping.enable_attention_dp:
             tp_size = 1
 
         mapping = Mapping(
-            world_size=tp_size * pp_size,
+            world_size=kvp_size * tp_size * pp_size,
             tp_size=tp_size,
             pp_size=pp_size,
+            kvp_size=kvp_size,
             rank=config.mapping.rank,
             gpus_per_node=config.mapping.gpus_per_node,
             enable_attention_dp=config.mapping.enable_attention_dp,
@@ -428,9 +430,9 @@ class MLA(nn.Module):
         quant_config = config.get_quant_config()
         self.quant_config = quant_config
 
-        self.kvp_size = config.mapping.kvp_size if config else 1
-        self.kvp_group = config.mapping.kvp_group if config else None
-        self.kvp_rank = config.mapping.kvp_rank if config else 0
+        self.kvp_size = config.mapping.kvp_size
+        self.kvp_group = config.mapping.kvp_group
+        self.kvp_rank = config.mapping.kvp_rank
 
         if not self.is_lite:
             self.fused_a = Linear(
@@ -767,7 +769,6 @@ class MLA(nn.Module):
             q, k, v = qkv, None, None
         return q, k, v
 
- TODO need to do this with attn_cp_size for context, and apply kvp only for gen (I guess, let's see)
     def _split_kv_for_kvp(self, k: torch.Tensor, v: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Split key and value tensors for key-value parallelism across sequence dimension."""
         if self.kvp_size == 1:
@@ -833,7 +834,7 @@ class MLA(nn.Module):
                 attn_metadata,
                 attention_input_type=AttentionInputType.context_only,
                 latent_cache=latent_cache,
-                out_scale=None,
+                out_scale=None,  # Currently we use BF16 MHA for context phase
                 compute_attention_stats=True
             )
 
@@ -850,7 +851,7 @@ class MLA(nn.Module):
                 attn_metadata,
                 attention_input_type=AttentionInputType.context_only,
                 latent_cache=latent_cache,
-                out_scale=None,
+                out_scale=None,  # Currently we use BF16 MHA for context phase
                 attention_stats=gathered_stats
             )
         else:
@@ -986,7 +987,7 @@ class MLA(nn.Module):
                 attn_metadata,
                 attention_input_type=AttentionInputType.context_only,
                 latent_cache=None,
-                out_scale=None,
+                out_scale=None,  # Currently we use BF16 MHA for context phase
                 mla_context_paged_kv=full_kv,
                 mla_context_kv_cache_block_offsets=mla_context_kv_cache_block_offsets,
                 compute_attention_stats=True
@@ -1005,7 +1006,7 @@ class MLA(nn.Module):
                 attn_metadata,
                 attention_input_type=AttentionInputType.context_only,
                 latent_cache=None,
-                out_scale=None,
+                out_scale=None,  # Currently we use BF16 MHA for context phase
                 mla_context_paged_kv=full_kv,
                 mla_context_kv_cache_block_offsets=mla_context_kv_cache_block_offsets,
                 attention_stats=gathered_stats
@@ -1100,7 +1101,8 @@ class MLA(nn.Module):
         ])
 
         # out_scale = getattr(self.o_proj, "inv_input_scale", None)
-        out_scale = None  # Although we use FP8 MLA for generation phase, the output is still in BF16
+        # Although we use FP8 MLA for generation phase, the output is still in BF16
+        out_scale = None
 
         if self.kvp_size > 1:
             # Step 1: Compute attention statistics

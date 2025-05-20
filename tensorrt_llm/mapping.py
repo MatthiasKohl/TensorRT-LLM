@@ -126,7 +126,7 @@ class Mapping(object):
             moe_ep_size=-1,  # -1 means no moe
             attn_tp_size=-1,
             attn_cp_size=-1,
-            kvp_size=1,  # Size of key-value parallelism
+            kvp_size=1,  # Size of helix parallelism (sequence parallelism in gen)
             auto_parallel=False,
             enable_attention_dp=False):
         # set default values for non-moe cases
@@ -147,7 +147,7 @@ class Mapping(object):
         if attn_tp_size == -1 and attn_cp_size == -1:
             # fallback to ulysses
             attn_tp_size = tp_size * cp_size
-            attn_cp_size = kvp_size
+            attn_cp_size = 1
 
         elif attn_tp_size == -1:
             attn_tp_size = (cp_size * tp_size * kvp_size) // attn_cp_size
@@ -160,7 +160,7 @@ class Mapping(object):
                 f"attn_cp_size must be 1 for now, but got {attn_tp_size}, {attn_cp_size}."
             )
 
-        if cp_size == 1 or kvp_size == 1:
+        if cp_size != 1 and kvp_size != 1:
             raise ValueError(
                 f"Either cp_size or kvp_size must be 1 for now, but got {cp_size}, {kvp_size}."
             )
@@ -178,9 +178,9 @@ class Mapping(object):
 
         moe_tp_ep_size = moe_tp_size * moe_ep_size
         moe_tp_cluster_ep_size = moe_tp_ep_size * moe_cluster_size
-        if moe_tp_cluster_ep_size != tp_size:
+        if moe_tp_cluster_ep_size != tp_size * kvp_size:
             raise ValueError(
-                f"tp_size must equal to moe_tp_size * moe_ep_size * moe_cluster_size, but got {tp_size} != {moe_tp_size} * {moe_ep_size} * {moe_cluster_size}"
+                f"tp_size * kvp_size must equal to moe_tp_size * moe_ep_size * moe_cluster_size, but got {tp_size} * {kvp_size} != {moe_tp_size} * {moe_ep_size} * {moe_cluster_size}"
             )
 
         attn_tp_cp_size = attn_tp_size * attn_cp_size
@@ -237,7 +237,7 @@ class Mapping(object):
                               i * tp_size * cp_size + (j + 1) * tp_size)
                 self.tp_groups.append(list(ranks))
 
-        # init kvp group - similar to tp groups but for key-value parallelism
+        # init kvp group - similar to tp groups but for helix parallelism
         for i in range(pp_size):
             for j in range(cp_size):
                 for k in range(tp_size // kvp_size):
