@@ -421,7 +421,8 @@ def attention(
     mrope_position_deltas: Optional[torch.Tensor],
     mla_context_paged_kv: Optional[torch.Tensor],
     mla_context_kv_cache_block_offsets: Optional[torch.Tensor],
-) -> torch.Tensor:
+    compute_attention_stats: bool,
+) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
     num_tokens = q.size(0)
     attention_input_type = (AttentionInputType(attention_input_type)
                             if attention_input_type is not None else
@@ -431,27 +432,52 @@ def attention(
     if out_dtype is None:
         out_dtype = q.dtype
 
-    output = q.new_empty((num_tokens, num_heads * v_head_size), dtype=out_dtype)
-    torch.ops.trtllm.attention_inplace(
-        q, k, v, output, out_dtype, workspace, sequence_length,
-        host_past_key_value_lengths, context_lengths, host_context_lengths,
-        host_request_types, kv_cache_block_offsets, host_kv_cache_block_offsets,
-        host_kv_cache_pool_pointers, host_kv_cache_pool_mapping,
-        cache_indirection, kv_scale_orig_quant, kv_scale_quant_orig, out_scale,
-        rotary_inv_freq, rotary_cos_sin, latent_cache, q_pe, block_ids_per_seq,
-        is_fused_qkv, update_kv_cache, predicted_tokens_per_seq, layer_idx,
-        num_heads, num_kv_heads, head_size, tokens_per_block, max_num_requests,
-        max_context_length, attention_window_size, sink_token_length,
-        beam_width, mask_type, quant_mode, q_scaling, position_embedding_type,
-        rotary_embedding_dim, rotary_embedding_base,
-        rotary_embedding_scale_type, rotary_embedding_scale,
-        rotary_embedding_short_m_scale, rotary_embedding_long_m_scale,
-        rotary_embedding_max_positions, rotary_embedding_original_max_positions,
-        use_paged_context_fmha, attention_input_type, is_mla_enable,
-        q_lora_rank, kv_lora_rank, qk_nope_head_dim, qk_rope_head_dim,
-        v_head_dim, mrope_rotary_cos_sin, mrope_position_deltas,
-        mla_context_paged_kv, mla_context_kv_cache_block_offsets)
-    return output
+    if compute_attention_stats:
+        output = q.new_empty((num_tokens, num_heads * v_head_size), dtype=out_dtype)
+        stats = q.new_empty((num_tokens, num_heads, 2), dtype=torch.float32)
+        torch.ops.trtllm.attention_inplace(
+            q, k, v, output, stats, out_dtype, workspace, sequence_length,
+            host_past_key_value_lengths, context_lengths, host_context_lengths,
+            host_request_types, kv_cache_block_offsets, host_kv_cache_block_offsets,
+            host_kv_cache_pool_pointers, host_kv_cache_pool_mapping,
+            cache_indirection, kv_scale_orig_quant, kv_scale_quant_orig, out_scale,
+            rotary_inv_freq, rotary_cos_sin, latent_cache, q_pe, block_ids_per_seq,
+            is_fused_qkv, update_kv_cache, predicted_tokens_per_seq, layer_idx,
+            num_heads, num_kv_heads, head_size, tokens_per_block, max_num_requests,
+            max_context_length, attention_window_size, sink_token_length,
+            beam_width, mask_type, quant_mode, q_scaling, position_embedding_type,
+            rotary_embedding_dim, rotary_embedding_base,
+            rotary_embedding_scale_type, rotary_embedding_scale,
+            rotary_embedding_short_m_scale, rotary_embedding_long_m_scale,
+            rotary_embedding_max_positions, rotary_embedding_original_max_positions,
+            use_paged_context_fmha, attention_input_type, is_mla_enable,
+            q_lora_rank, kv_lora_rank, qk_nope_head_dim, qk_rope_head_dim,
+            v_head_dim, mrope_rotary_cos_sin, mrope_position_deltas,
+            mla_context_paged_kv, mla_context_kv_cache_block_offsets, stats
+        )
+        return output, stats
+    else:
+        output = q.new_empty((num_tokens, num_heads * v_head_size), dtype=out_dtype)
+        torch.ops.trtllm.attention_inplace(
+            q, k, v, output, out_dtype, workspace, sequence_length,
+            host_past_key_value_lengths, context_lengths, host_context_lengths,
+            host_request_types, kv_cache_block_offsets, host_kv_cache_block_offsets,
+            host_kv_cache_pool_pointers, host_kv_cache_pool_mapping,
+            cache_indirection, kv_scale_orig_quant, kv_scale_quant_orig, out_scale,
+            rotary_inv_freq, rotary_cos_sin, latent_cache, q_pe, block_ids_per_seq,
+            is_fused_qkv, update_kv_cache, predicted_tokens_per_seq, layer_idx,
+            num_heads, num_kv_heads, head_size, tokens_per_block, max_num_requests,
+            max_context_length, attention_window_size, sink_token_length,
+            beam_width, mask_type, quant_mode, q_scaling, position_embedding_type,
+            rotary_embedding_dim, rotary_embedding_base,
+            rotary_embedding_scale_type, rotary_embedding_scale,
+            rotary_embedding_short_m_scale, rotary_embedding_long_m_scale,
+            rotary_embedding_max_positions, rotary_embedding_original_max_positions,
+            use_paged_context_fmha, attention_input_type, is_mla_enable,
+            q_lora_rank, kv_lora_rank, qk_nope_head_dim, qk_rope_head_dim,
+            v_head_dim, mrope_rotary_cos_sin, mrope_position_deltas,
+            mla_context_paged_kv, mla_context_kv_cache_block_offsets, None)
+        return output
 
 
 @attention.register_fake

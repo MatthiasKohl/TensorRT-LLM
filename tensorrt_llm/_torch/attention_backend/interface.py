@@ -528,7 +528,6 @@ class AttentionBackend(Generic[TMetadata]):
         *,
         attention_mask: AttentionMask = PredefinedAttentionMask.CAUSAL,
         compute_attention_stats: bool = False,
-        attention_stats: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         """
@@ -543,8 +542,7 @@ class AttentionBackend(Generic[TMetadata]):
                                         or None if QKV tensor is provided, or there's no new kv token.
             metadata (AttentionMetadata): Metadata for the attention operation.
             attention_mask (AttentionMask): Attention mask. See definition of `AttentionMask` for accepted types. Defaults to predefined causal mask.
-            compute_attention_stats (bool): Whether to compute local attention statistics. Defaults to False.
-            attention_stats (Optional[torch.Tensor]): Pre-computed attention statistics from all ranks. If provided, uses these stats to compute final output.
+            compute_attention_stats (bool): Whether to output local attention statistics. Defaults to False.
         Returns:
             torch.Tensor with shape (num_q_tokens, num_heads * head_dim)
         """

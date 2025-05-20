@@ -245,7 +245,6 @@ class TrtllmAttentionWrapper:
         update_kv_cache: bool = True,
         attention_mask: AttentionMask = PredefinedAttentionMask.CAUSAL,
         compute_attention_stats: bool = False,
-        attention_stats: Optional[torch.Tensor] = None,
     ):
         """
         Run the attention operation.
@@ -257,8 +256,7 @@ class TrtllmAttentionWrapper:
             is_fused_qkv (bool): Whether QKV tensor is provided.
             update_kv_cache (bool): Whether KV cache is updated.
             attention_mask (AttentionMask): Attention mask. See definition of AttentionMask for accepted types. Defaults to predefined causal mask.
-            compute_attention_stats (bool): Whether to compute local attention statistics. Defaults to False.
-            attention_stats (Optional[torch.Tensor]): Pre-computed attention statistics from all ranks. If provided, uses these stats to compute final output.
+            compute_attention_stats (bool): Whether to output local attention statistics. Defaults to False.
         Returns:
             torch.Tensor with shape (num_tokens, num_heads * head_dim).
         """
@@ -395,7 +393,6 @@ class TrtllmAttentionWrapper:
             self.mla_context_paged_kv,
             self.mla_context_kv_cache_block_offsets,
             compute_attention_stats,
-            attention_stats,
         )
         # reset the planned states (especially tensors) to avoid memory leak
         self.plan()
@@ -761,7 +758,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         mla_context_paged_kv: Optional[torch.Tensor] = None,
         mla_context_kv_cache_block_offsets: Optional[torch.Tensor] = None,
         compute_attention_stats: bool = False,
-        attention_stats: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         assert isinstance(
@@ -831,8 +827,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                                   update_kv_cache=not metadata.is_cross
                                   or k is not None,
                                   attention_mask=attention_mask,
-                                  compute_attention_stats=compute_attention_stats,
-                                  attention_stats=attention_stats)
+                                  compute_attention_stats=compute_attention_stats)
         return output
 
     @classmethod

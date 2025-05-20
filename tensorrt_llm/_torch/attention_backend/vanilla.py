@@ -229,7 +229,11 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
                 metadata: VanillaAttentionMetadata,
                 *,
                 attention_mask: AttentionMask = PredefinedAttentionMask.CAUSAL,
+                compute_attention_stats: bool = False,
                 **kwargs) -> torch.Tensor:
+        if compute_attention_stats:
+            raise NotImplementedError("VanillaAttention does not support compute_attention_stats yet.")
+
         if metadata.kv_cache_manager is None:
             # NOTE: WAR for no kv cache attn e.g. BERT,
             # try to separate the kv cache estimation path from no kv cache attn.

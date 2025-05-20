@@ -642,6 +642,32 @@ class MLA(nn.Module):
                                                    self.qk_rope_head_dim)
         return k_pe
 
+    def _attn_forward(self, attn_instance, *args, **kwargs):
+        if self.kvp_size > 1:
+            # TODO check the dimensions of these and over which to apply reductions
+            # TODO add detailed comments
+            partial_o, softmax_stats = attn_instance.forward(
+                *args,
+                compute_attention_stats=True,
+                **kwargs
+            )
+            gathered_stats = [torch.empty_like(softmax_stats) for _ in range(self.kvp_size)]
+            torch.distributed.all_gather(gathered_stats, softmax_stats, group=self.kvp_group)
+            gathered_stats = torch.cat(gathered_stats, dim=0)  # Concatenate along sequence dimension
+            gathered_o = [torch.empty_like(partial_o) for _ in range(self.kvp_size)]
+            torch.distributed.all_gather(gathered_o, partial_o, group=self.kvp_group)
+            gathered_o = torch.cat(gathered_o, dim=0)  # Concatenate along sequence dimension
+            global_max = torch.max(gathered_stats[..., 0], dim=0, keepdim=True)
+            corrected_max = gathered_stats[..., 0] - global_max
+            corrected_max_exp = torch.exp(corrected_max)
+            corrected_sum = gathered_stats[..., 1] * corrected_max_exp
+            global_sum = torch.sum(corrected_sum, dim=0, keepdim=True)
+            corrected_o = gathered_o * corrected_max_exp / global_sum
+            attn_output = torch.sum(corrected_o, dim=0)
+            return attn_output
+        else:
+            return attn_instance.forward(*args, **kwargs)
+
     def forward_impl_fake(self, hidden_states: torch.Tensor):
         num_tokens = hidden_states.shape[0]
         hidden_size = self.o_proj.in_features
@@ -792,9 +818,7 @@ class MLA(nn.Module):
         # May concat q(including q_pe), k + k_pe, v together
         q, k, v = self._maybe_concat_qkv(q, k, v)
 
-        if self.kvp_size > 1:
-            # Step 1: Compute attention statistics
-            attn_stats = self.mha.forward(
+        attn_output = self._attn_forward(self.mha,
                 q,
                 k,
                 v,
@@ -802,35 +826,7 @@ class MLA(nn.Module):
                 attention_input_type=AttentionInputType.context_only,
                 latent_cache=latent_cache,
                 out_scale=None,  # Currently we use BF16 MHA for context phase
-                compute_attention_stats=True
-            )
-
-            # Step 2: Gather statistics from all KVP ranks
-            gathered_stats = [torch.empty_like(attn_stats) for _ in range(self.kvp_size)]
-            torch.distributed.all_gather(gathered_stats, attn_stats, group=self.kvp_group)
-            gathered_stats = torch.cat(gathered_stats, dim=0)  # Concatenate along sequence dimension
-
-            # Step 3: Compute final output using gathered statistics
-            attn_output = self.mha.forward(
-                q,
-                k,
-                v,
-                attn_metadata,
-                attention_input_type=AttentionInputType.context_only,
-                latent_cache=latent_cache,
-                out_scale=None,  # Currently we use BF16 MHA for context phase
-                attention_stats=gathered_stats
-            )
-        else:
-            attn_output = self.mha.forward(
-                q,
-                k,
-                v,
-                attn_metadata,
-                attention_input_type=AttentionInputType.context_only,
-                latent_cache=latent_cache,
-                out_scale=None,  # Currently we use BF16 MHA for context phase
-            )
+        )
 
         return attn_output
 
@@ -939,51 +935,17 @@ class MLA(nn.Module):
             attn_metadata,
         )
 
-        if self.kvp_size > 1:
-            # Step 1: Compute attention statistics
-            attn_stats = self.mha.forward(
-                q,
-                None,
-                None,
-                attn_metadata,
-                attention_input_type=AttentionInputType.context_only,
-                latent_cache=None,
-                out_scale=None,  # Currently we use BF16 MHA for context phase
-                mla_context_paged_kv=full_kv,
-                mla_context_kv_cache_block_offsets=mla_context_kv_cache_block_offsets,
-                compute_attention_stats=True
-            )
-
-            # Step 2: Gather statistics from all KVP ranks
-            gathered_stats = [torch.empty_like(attn_stats) for _ in range(self.kvp_size)]
-            torch.distributed.all_gather(gathered_stats, attn_stats, group=self.kvp_group)
-            gathered_stats = torch.cat(gathered_stats, dim=0)  # Concatenate along sequence dimension
-
-            # Step 3: Compute final output using gathered statistics
-            attn_output = self.mha.forward(
-                q,
-                None,
-                None,
-                attn_metadata,
-                attention_input_type=AttentionInputType.context_only,
-                latent_cache=None,
-                out_scale=None,  # Currently we use BF16 MHA for context phase
-                mla_context_paged_kv=full_kv,
-                mla_context_kv_cache_block_offsets=mla_context_kv_cache_block_offsets,
-                attention_stats=gathered_stats
-            )
-        else:
-            attn_output = self.mha.forward(
-                q,
-                None,
-                None,
-                attn_metadata,
-                attention_input_type=AttentionInputType.context_only,
-                latent_cache=None,
-                out_scale=None,  # Currently we use BF16 MHA for context phase
-                mla_context_paged_kv=full_kv,
-                mla_context_kv_cache_block_offsets=mla_context_kv_cache_block_offsets,
-            )
+        attn_output = self._attn_forward(self.mha,
+            q,
+            None,
+            None,
+            attn_metadata,
+            attention_input_type=AttentionInputType.context_only,
+            latent_cache=None,
+            out_scale=None,  # Currently we use BF16 MHA for context phase
+            mla_context_paged_kv=full_kv,
+            mla_context_kv_cache_block_offsets=mla_context_kv_cache_block_offsets
+        )
 
         return attn_output
 
@@ -1065,9 +1027,7 @@ class MLA(nn.Module):
         # Although we use FP8 MLA for generation phase, the output is still in BF16
         out_scale = None
 
-        if self.kvp_size > 1:
-            # Step 1: Compute attention statistics
-            attn_stats = self.mqa.forward(
+        attn_out_latent = self._attn_forward(self.mqa,
                 fused_q,
                 None,
                 None,
@@ -1076,37 +1036,7 @@ class MLA(nn.Module):
                 out_scale=out_scale,
                 latent_cache=latent_cache,  # kvcache and k_pe
                 q_pe=q_pe,  # used by `invokeMLARopeGeneration`
-                compute_attention_stats=True
-            )
-
-            # Step 2: Gather statistics from all KVP ranks
-            gathered_stats = [torch.empty_like(attn_stats) for _ in range(self.kvp_size)]
-            torch.distributed.all_gather(gathered_stats, attn_stats, group=self.kvp_group)
-            gathered_stats = torch.cat(gathered_stats, dim=0)  # Concatenate along sequence dimension
-
-            # Step 3: Compute final output using gathered statistics
-            attn_out_latent = self.mqa.forward(
-                fused_q,
-                None,
-                None,
-                attn_metadata,
-                attention_input_type=AttentionInputType.generation_only,
-                out_scale=out_scale,
-                latent_cache=latent_cache,  # kvcache and k_pe
-                q_pe=q_pe,  # used by `invokeMLARopeGeneration`
-                attention_stats=gathered_stats
-            )
-        else:
-            attn_out_latent = self.mqa.forward(
-                fused_q,
-                None,
-                None,
-                attn_metadata,
-                attention_input_type=AttentionInputType.generation_only,
-                out_scale=out_scale,
-                latent_cache=latent_cache,  # kvcache and k_pe
-                q_pe=q_pe,  # used by `invokeMLARopeGeneration`
-            )
+        )
 
         fused_q = None
 
