@@ -291,8 +291,13 @@ class PyTorchModelEngine(ModelEngine):
     ):
         self.ub_buffers = None
         self.batch_size = batch_size
-        self.max_num_tokens = max_num_tokens
-        self.max_seq_len = max_seq_len
+        self.max_num_tokens = (max_num_tokens + mapping.kvp_size - 1) // mapping.kvp_size
+        self.max_seq_len = (max_seq_len + mapping.kvp_size - 1) // mapping.kvp_size
+        if mapping.has_kvp():
+            logger.info(
+                f"KVP size: {mapping.kvp_size}. Updated max num tokens: {self.max_num_tokens}"
+                f" (was {max_num_tokens}), max seq len: {self.max_seq_len} (was {max_seq_len})"
+            )
 
         self.mapping = mapping
         if mapping.has_pp():
@@ -953,7 +958,12 @@ class PyTorchModelEngine(ModelEngine):
             logger.info(
                 f"max_seq_len is not specified, using inferred value {inferred_max_seq_len}"
             )
-            self.max_seq_len = inferred_max_seq_len
+            self.max_seq_len = (inferred_max_seq_len + self.mapping.kvp_size - 1) // self.mapping.kvp_size
+            if self.mapping.has_kvp():
+                logger.info(
+                    f"Updated max seq len from inferred value ({inferred_max_seq_len}) to "
+                    f"{self.max_seq_len} due to KVP size {self.mapping.kvp_size}"
+                )
 
     def _init_max_num_tokens(self):
         # Modified from tensorrt_llm/_common.py check_max_num_tokens

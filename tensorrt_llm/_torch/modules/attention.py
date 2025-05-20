@@ -723,11 +723,6 @@ class MLA(nn.Module):
             k_pe_gen = k_pe[num_ctx_tokens:, ...]
             latent_cache_gen = latent_cache[num_ctx_tokens:, ...]
 
-            # Split generation tensors for KVP
-            compressed_kv_gen, _ = self._split_kv_for_kvp(compressed_kv_gen, compressed_kv_gen)
-            k_pe_gen, _ = self._split_kv_for_kvp(k_pe_gen, k_pe_gen)
-            latent_cache_gen, _ = self._split_kv_for_kvp(latent_cache_gen, latent_cache_gen)
-
             if self.apply_rotary_emb:
                 assert position_ids is not None
                 k_pe_gen = self.apply_rope(q_gen, k_pe_gen, position_ids)
@@ -769,31 +764,6 @@ class MLA(nn.Module):
             q, k, v = qkv, None, None
         return q, k, v
 
-    def _split_kv_for_kvp(self, k: torch.Tensor, v: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Split key and value tensors for key-value parallelism across sequence dimension."""
-        if self.kvp_size == 1:
-            return k, v
-            
-        # Get the sequence length dimension (first dimension)
-        seq_len = k.shape[0]
-        
-        # Calculate the split size for each GPU
-        split_size = (seq_len + self.kvp_size - 1) // self.kvp_size
-        
-        # Calculate start and end indices for this rank
-        start_idx = self.kvp_rank * split_size
-        end_idx = min(start_idx + split_size, seq_len)
-        
-        # Handle edge case where this rank gets no data
-        if start_idx >= seq_len:
-            return k.new_empty([0] + list(k.shape[1:])), v.new_empty([0] + list(v.shape[1:]))
-            
-        # Split along sequence dimension
-        k_split = k[start_idx:end_idx]
-        v_split = v[start_idx:end_idx]
-        
-        return k_split, v_split
-
     def forward_context_default(
         self,
         q: torch.Tensor,
@@ -818,9 +788,6 @@ class MLA(nn.Module):
             k[..., self.qk_nope_head_dim:] = k_pe.view(-1, 1,
                                                        self.qk_rope_head_dim)
         k = k.view(-1, self.num_heads * self.qk_head_dim)
-
-        # Process k and v based on KVP configuration
-        k, v = self._split_kv_for_kvp(k, v)
 
         # May concat q(including q_pe), k + k_pe, v together
         q, k, v = self._maybe_concat_qkv(q, k, v)
@@ -900,9 +867,6 @@ class MLA(nn.Module):
                                        self.qk_nope_head_dim)
         past_v = past_v.view(-1, self.num_heads, self.v_head_dim)
 
-        # Process past k and v based on KVP configuration
-        past_k_nope, past_v = self._split_kv_for_kvp(past_k_nope, past_v)
-
         # compute current k_nope and v from compressed_kv
         kv = self.kv_b_proj(compressed_kv)
         k_nope, v = kv.split([
@@ -910,9 +874,6 @@ class MLA(nn.Module):
             self.num_heads * self.v_head_dim
         ],
                              dim=-1)
-
-        # Process current k and v based on KVP configuration
-        k_nope, v = self._split_kv_for_kvp(k_nope, v)
 
         # split current q into q_nope and q_pe
         q_nope, q_pe = q.view([

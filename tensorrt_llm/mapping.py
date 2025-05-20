@@ -437,6 +437,12 @@ class Mapping(object):
     def has_moe_ep(self):
         return self.moe_ep_size > 1
 
+    def has_kvp(self):
+        return self.kvp_size > 1
+
+    def is_last_kvp_rank(self):
+        return self.kvp_rank == self.kvp_size - 1
+
     def pp_layers(self, num_layers: int) -> List[int]:
         base_layers = num_layers // self.pp_size
         extra_layers = num_layers % self.pp_size
