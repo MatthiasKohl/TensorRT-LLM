@@ -25,7 +25,7 @@ from tensorrt_llm._utils import (is_trace_enabled, nvtx_range, release_gc,
 from tensorrt_llm.bindings.executor import GuidedDecodingConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_manager import LoraConfig, LoraModelConfig
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.mapping import Mapping, CpType
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 from tensorrt_llm.quantization.utils.fp4_utils import float4_e2m1x2
 
@@ -576,7 +576,7 @@ class PyTorchModelEngine(ModelEngine):
 
         # TODO: current warmup_request is not suitable for star attention
         cp_type = self.mapping.cp_config.get('cp_type', None)
-        if cp_type == 'star_attention':
+        if cp_type == CpType.STAR:
             return
 
         with contextlib.ExitStack() as stack:
@@ -1848,11 +1848,11 @@ class PyTorchModelEngine(ModelEngine):
             new_tensors_device: Optional[SampleStateTensors] = None):
         if self.mapping is not None and 'cp_type' in self.mapping.cp_config:
             cp_type = self.mapping.cp_config['cp_type']
-            if 'star_attention' == cp_type:
+            if cp_type == CpType.STAR:
                 return self._prepare_star_attention_inputs(
                     scheduled_requests, kv_cache_manager, attn_metadata)
             else:
-                assert False, f'Unsupport cp_type {cp_type}'
+                assert False, f'Unsupported cp_type {cp_type}'
         else:
             return self._prepare_tp_inputs(scheduled_requests, kv_cache_manager,
                                            attn_metadata, spec_metadata,

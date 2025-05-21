@@ -28,7 +28,7 @@ from tensorrt_llm.bindings.executor import (DisServingRequestStats,
 from tensorrt_llm.bindings.internal.batch_manager import (LlmRequestType,
                                                           ReqIdsSet)
 from tensorrt_llm.logger import logger
-
+from tensorrt_llm.mapping import CpType
 from ..distributed import Distributed
 from .kv_cache_transceiver import KvCacheTransceiver
 from .llm_request import (ExecutorRequest, ExecutorResponse, LlmRequest,
@@ -1453,12 +1453,12 @@ class PyExecutor:
         cp_config = self.dist.cp_config
         if 'cp_type' in cp_config:
             cp_type = cp_config['cp_type']
-            if cp_type == 'star_attention':
+            if cp_type == CpType.STAR:
                 ret = self._merge_star_attention_requests(new_requests)
-            elif cp_type == 'ring_attention':
-                raise NotImplementedError("ring attention not implemented yet")
+            elif cp_type == CpType.RING:
+                raise NotImplementedError("Ring attention not implemented yet")
             else:
-                raise NotImplementedError(f'unsupport cp type {cp_type}')
+                raise NotImplementedError(f'Unsupported cp type {cp_type}')
         else:
             ret = self._merge_tp_requests(new_requests)
         return ret
@@ -1638,10 +1638,10 @@ class PyExecutor:
         cp_config = self.dist.cp_config
         if 'cp_type' in cp_config:
             cp_type = cp_config['cp_type']
-            if cp_type == 'star_attention':
+            if cp_type == CpType.STAR:
                 self._update_request_states_star_attention(scheduled_requests)
             else:
-                assert False, f'Unsupport cp_type {cp_type}'
+                assert False, f'Unsupported cp_type {cp_type}'
         else:
             self._update_request_states_tp(scheduled_requests)
 

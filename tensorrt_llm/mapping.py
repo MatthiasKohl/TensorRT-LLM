@@ -19,8 +19,12 @@ from typing import List
 class CpType(IntEnum):
     # CP type for ulysses parallelism
     ULYSSES = 0
+    # CP type for star attention
+    STAR = 1
+    # CP type for ring attention
+    RING = 2
     # CP type for helix parallelism
-    HELIX = 1
+    HELIX = 3
 
 
 class Mapping(object):
@@ -134,7 +138,6 @@ class Mapping(object):
             moe_ep_size=-1,  # -1 means no moe
             attn_tp_size=-1,
             attn_cp_size=-1,
-            cp_type=CpType.ULYSSES,
             auto_parallel=False,
             enable_attention_dp=False):
         # set default values for non-moe cases
@@ -142,6 +145,7 @@ class Mapping(object):
         if moe_cluster_size == -1:
             moe_cluster_size = 1
 
+        cp_type = cp_config.get("cp_type", CpType.ULYSSES)
         moe_world_size = tp_size if cp_type == CpType.ULYSSES else tp_size * cp_size
         if moe_tp_size == -1 and moe_ep_size == -1:
             moe_tp_size = moe_world_size // moe_cluster_size
@@ -210,7 +214,6 @@ class Mapping(object):
         self.moe_cluster_size = moe_cluster_size
         self.attn_tp_size = attn_tp_size
         self.attn_cp_size = attn_cp_size
-        self.cp_type = cp_type
         self.auto_parallel = auto_parallel
         self.world_size = world_size
         self.enable_attention_dp = enable_attention_dp
@@ -287,7 +290,7 @@ class Mapping(object):
                 and self.moe_ep_size == other.moe_ep_size
                 and self.attn_tp_size == other.attn_tp_size
                 and self.attn_cp_size == other.attn_cp_size
-                and self.cp_type == other.cp_type
+                and self.cp_config == other.cp_config
                 and self.auto_parallel == other.auto_parallel)
 
     def __hash__(self):
@@ -303,7 +306,7 @@ class Mapping(object):
             self.moe_ep_size,
             self.attn_tp_size,
             self.attn_cp_size,
-            self.cp_type,
+            self.cp_config,
             self.auto_parallel,
         ))
 
@@ -390,10 +393,10 @@ class Mapping(object):
         return self.rank % self.gpus_per_node
 
     def has_cp_ulysses(self):
-        return self.cp_size > 1 and self.cp_type == CpType.ULYSSES
+        return self.cp_size > 1 and self.cp_config.get("cp_type", CpType.ULYSSES) == CpType.ULYSSES
 
     def has_cp_helix(self):
-        return self.cp_size > 1 and self.cp_type == CpType.HELIX
+        return self.cp_size > 1 and self.cp_config.get("cp_type", CpType.HELIX) == CpType.HELIX
 
     def is_last_helix_rank(self):
         return self.cp_rank == self.cp_size - 1
@@ -475,6 +478,6 @@ class Mapping(object):
             'moe_ep_size': self.moe_ep_size,
             'attn_tp_size': self.attn_tp_size,
             'attn_cp_size': self.attn_cp_size,
-            'cp_type': self.cp_type,
+            'cp_config': self.cp_config,
             'auto_parallel': self.auto_parallel,
         }
