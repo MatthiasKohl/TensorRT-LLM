@@ -407,15 +407,17 @@ class MLA(nn.Module):
         config = config or ModelConfig()
         tp_size = config.mapping.tp_size
         pp_size = config.mapping.pp_size
-        kvp_size = config.mapping.kvp_size
+        cp_size = config.mapping.cp_size
         if config.mapping.enable_attention_dp:
             tp_size = 1
+        if config.mapping.cp_type == CpType.ULYSSES and cp_size > 1:
+            raise NotImplementedError("MLA doesn't support CP Ulyssees yet")
 
         mapping = Mapping(
-            world_size=kvp_size * tp_size * pp_size,
+            world_size=cp_size * tp_size * pp_size,
             tp_size=tp_size,
             pp_size=pp_size,
-            kvp_size=kvp_size,
+            cp_size=cp_size,
             rank=config.mapping.rank,
             gpus_per_node=config.mapping.gpus_per_node,
             enable_attention_dp=config.mapping.enable_attention_dp,
@@ -430,10 +432,10 @@ class MLA(nn.Module):
         quant_config = config.get_quant_config()
         self.quant_config = quant_config
 
-        self.kvp_size = config.mapping.kvp_size
-        self.kvp_group = config.mapping.kvp_group
-        self.kvp_rank = config.mapping.kvp_rank
-
+        self.cp_size = config.mapping.cp_size
+        self.cp_group = config.mapping.cp_group
+        self.cp_rank = config.mapping.cp_rank
+        self.cp_type = config.mapping.cp_type
         if not self.is_lite:
             self.fused_a = Linear(
                 hidden_size,
@@ -642,27 +644,35 @@ class MLA(nn.Module):
                                                    self.qk_rope_head_dim)
         return k_pe
 
-    def _attn_forward(self, attn_instance, *args, **kwargs):
-        if self.kvp_size > 1:
+    def _attn_forward(self, attn_instance: AttentionBackend, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, attn_metadata: AttentionMetadata, **kwargs):
+        if self.cp_size > 1 and self.cp_type == CpType.HELIX:
             # TODO check the dimensions of these and over which to apply reductions
             # TODO add detailed comments
+            # partial_o: [local_num_tokens, num_heads, qk_head_dim]
+            # softmax_stats: [local_num_tokens, num_heads, 2]
             partial_o, softmax_stats = attn_instance.forward(
                 *args,
                 compute_attention_stats=True,
                 **kwargs
             )
-            gathered_stats = [torch.empty_like(softmax_stats) for _ in range(self.kvp_size)]
-            torch.distributed.all_gather(gathered_stats, softmax_stats, group=self.kvp_group)
-            gathered_stats = torch.cat(gathered_stats, dim=0)  # Concatenate along sequence dimension
-            gathered_o = [torch.empty_like(partial_o) for _ in range(self.kvp_size)]
-            torch.distributed.all_gather(gathered_o, partial_o, group=self.kvp_group)
-            gathered_o = torch.cat(gathered_o, dim=0)  # Concatenate along sequence dimension
+            # TODO for now we are gathering with unknown sizes, we should keep
+            # track of the sizes across the cp_group and then gather with known sizes
+            all_gathered = self.dist.cp_allgather([partial_o, softmax_stats])
+            # [local_num_tokens, num_heads, qk_head_dim] -> [num_tokens, num_heads, qk_head_dim]
+            gathered_o = torch.cat([item[0] for item in all_gathered], dim=0)
+            # [local_num_tokens, num_heads, 2] -> [num_tokens, num_heads, 2]
+            gathered_stats = torch.cat([item[1] for item in all_gathered], dim=0)
+
+            # [num_tokens, num_heads] -> [1, num_heads]
             global_max = torch.max(gathered_stats[..., 0], dim=0, keepdim=True)
+            # [num_tokens, num_heads]
             corrected_max = gathered_stats[..., 0] - global_max
             corrected_max_exp = torch.exp(corrected_max)
             corrected_sum = gathered_stats[..., 1] * corrected_max_exp
+            # [num_tokens, num_heads] -> [1, num_heads]
             global_sum = torch.sum(corrected_sum, dim=0, keepdim=True)
-            corrected_o = gathered_o * corrected_max_exp / global_sum
+            # TODO check how to multiply this s.t. we correctly sum up afterwards (cannot be over dim=0 easily)
+            corrected_o = gathered_o * torch.unsqueeze(corrected_max_exp / global_sum, -1)
             attn_output = torch.sum(corrected_o, dim=0)
             return attn_output
         else:

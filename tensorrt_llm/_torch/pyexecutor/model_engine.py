@@ -291,13 +291,16 @@ class PyTorchModelEngine(ModelEngine):
     ):
         self.ub_buffers = None
         self.batch_size = batch_size
-        self.max_num_tokens = (max_num_tokens + mapping.kvp_size - 1) // mapping.kvp_size
-        self.max_seq_len = (max_seq_len + mapping.kvp_size - 1) // mapping.kvp_size
-        if mapping.has_kvp():
+        self.max_num_tokens = (max_num_tokens + mapping.attn_cp_size - 1) // mapping.attn_cp_size
+        self.max_seq_len = (max_seq_len + mapping.attn_cp_size - 1) // mapping.attn_cp_size
+        if mapping.has_cp_helix():
             logger.info(
-                f"KVP size: {mapping.kvp_size}. Updated max num tokens: {self.max_num_tokens}"
+                f"CP size: {mapping.attn_cp_size}. Updated max num tokens: {self.max_num_tokens}"
                 f" (was {max_num_tokens}), max seq len: {self.max_seq_len} (was {max_seq_len})"
             )
+            self.has_cp_helix = True
+        else:
+            self.has_cp_helix = False
 
         self.mapping = mapping
         if mapping.has_pp():
@@ -958,11 +961,11 @@ class PyTorchModelEngine(ModelEngine):
             logger.info(
                 f"max_seq_len is not specified, using inferred value {inferred_max_seq_len}"
             )
-            self.max_seq_len = (inferred_max_seq_len + self.mapping.kvp_size - 1) // self.mapping.kvp_size
-            if self.mapping.has_kvp():
+            self.max_seq_len = (inferred_max_seq_len + self.mapping.attn_cp_size - 1) // self.mapping.attn_cp_size
+            if self.has_cp_helix:
                 logger.info(
                     f"Updated max seq len from inferred value ({inferred_max_seq_len}) to "
-                    f"{self.max_seq_len} due to KVP size {self.mapping.kvp_size}"
+                    f"{self.max_seq_len} due to CP size {self.mapping.attn_cp_size}"
                 )
 
     def _init_max_num_tokens(self):
@@ -1329,24 +1332,29 @@ class PyTorchModelEngine(ModelEngine):
         # support attention dp
         if self.enable_attention_dp:
             if spec_metadata is not None:
-                all_rank_num_tokens = self.dist.tp_allgather([
+                all_tp_rank_num_tokens = self.dist.tp_allgather([
                     attn_metadata.num_tokens, spec_metadata.num_tokens,
                     len(sequence_lengths)
                 ])
                 attn_all_rank_num_tokens = [
-                    item[0] for item in all_rank_num_tokens
+                    item[0] for item in all_tp_rank_num_tokens
                 ]
                 spec_all_rank_num_tokens = [
-                    item[1] for item in all_rank_num_tokens
+                    item[1] for item in all_tp_rank_num_tokens
                 ]
-                all_rank_num_seqs = [item[2] for item in all_rank_num_tokens]
-                attn_metadata.all_rank_num_tokens = attn_all_rank_num_tokens
-                spec_metadata.all_rank_num_tokens = spec_all_rank_num_tokens
-                spec_metadata.all_rank_num_seqs = all_rank_num_seqs
+                all_tp_rank_num_seqs = [item[2] for item in all_tp_rank_num_tokens]
+                attn_metadata.all_tp_rank_num_tokens = attn_all_rank_num_tokens
+                spec_metadata.all_tp_rank_num_tokens = spec_all_rank_num_tokens
+                spec_metadata.all_tp_rank_num_seqs = all_tp_rank_num_seqs
             else:
-                all_rank_num_tokens = self.dist.tp_allgather(
+                all_tp_rank_num_tokens = self.dist.tp_allgather(
                     attn_metadata.num_tokens)
-                attn_metadata.all_rank_num_tokens = all_rank_num_tokens
+                attn_metadata.all_tp_rank_num_tokens = all_tp_rank_num_tokens
+
+        if self.has_cp_helix:
+            all_cp_rank_num_tokens = self.dist.cp_allgather(
+                attn_metadata.num_tokens)
+            attn_metadata.all_cp_rank_num_tokens = all_cp_rank_num_tokens
 
         num_generation_tokens = len(generation_requests) + len(
             extend_requests) + sum(draft_lens)
@@ -1415,9 +1423,9 @@ class PyTorchModelEngine(ModelEngine):
             )
 
         attn_metadata.num_contexts = len(scheduled_requests.context_requests)
-        if self.enable_attention_dp:
-            all_rank_num_tokens = self.dist.allgather(attn_metadata.num_tokens)
-            attn_metadata.all_rank_num_tokens = all_rank_num_tokens
+        if self.enable_attention_dp or self.has_cp_helix:
+            all_tp_rank_num_tokens = self.dist.allgather(attn_metadata.num_tokens)
+            attn_metadata.all_tp_rank_num_tokens = all_tp_rank_num_tokens
         # this is for no cache attention, not for dummy attention
         if attn_metadata.kv_cache_manager is None:
             assert isinstance(
@@ -1458,24 +1466,29 @@ class PyTorchModelEngine(ModelEngine):
         # support attention dp
         if self.enable_attention_dp:
             if spec_metadata is not None:
-                all_rank_num_tokens = self.dist.tp_allgather([
+                all_tp_rank_num_tokens = self.dist.tp_allgather([
                     attn_metadata.num_tokens, spec_metadata.num_tokens,
                     len(sequence_lengths)
                 ])
                 attn_all_rank_num_tokens = [
-                    item[0] for item in all_rank_num_tokens
+                    item[0] for item in all_tp_rank_num_tokens
                 ]
                 spec_all_rank_num_tokens = [
-                    item[1] for item in all_rank_num_tokens
+                    item[1] for item in all_tp_rank_num_tokens
                 ]
-                all_rank_num_seqs = [item[2] for item in all_rank_num_tokens]
-                attn_metadata.all_rank_num_tokens = attn_all_rank_num_tokens
-                spec_metadata.all_rank_num_tokens = spec_all_rank_num_tokens
-                spec_metadata.all_rank_num_seqs = all_rank_num_seqs
+                all_tp_rank_num_seqs = [item[2] for item in all_tp_rank_num_tokens]
+                attn_metadata.all_tp_rank_num_tokens = attn_all_rank_num_tokens
+                spec_metadata.all_tp_rank_num_tokens = spec_all_rank_num_tokens
+                spec_metadata.all_tp_rank_num_seqs = all_tp_rank_num_seqs
             else:
-                all_rank_num_tokens = self.dist.tp_allgather(
+                all_tp_rank_num_tokens = self.dist.tp_allgather(
                     attn_metadata.num_tokens)
-                attn_metadata.all_rank_num_tokens = all_rank_num_tokens
+                attn_metadata.all_tp_rank_num_tokens = all_tp_rank_num_tokens
+
+        if self.has_cp_helix:
+            all_cp_rank_num_tokens = self.dist.cp_allgather(
+                attn_metadata.num_tokens)
+            attn_metadata.all_cp_rank_num_tokens = all_cp_rank_num_tokens
 
         return inputs, None
 
@@ -1692,9 +1705,13 @@ class PyTorchModelEngine(ModelEngine):
 
         attn_metadata.prepare()
         if self.enable_attention_dp:
-            all_rank_num_tokens = self.dist.tp_allgather(
+            all_tp_rank_num_tokens = self.dist.tp_allgather(
                 attn_metadata.num_tokens)
-            attn_metadata.all_rank_num_tokens = all_rank_num_tokens
+            attn_metadata.all_tp_rank_num_tokens = all_tp_rank_num_tokens
+        if self.has_cp_helix:
+            all_cp_rank_num_tokens = self.dist.cp_allgather(
+                attn_metadata.num_tokens)
+            attn_metadata.all_cp_rank_num_tokens = all_cp_rank_num_tokens
 
         return {
             'attn_metadata': attn_metadata,

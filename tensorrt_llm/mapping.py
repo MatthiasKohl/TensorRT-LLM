@@ -12,7 +12,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from enum import IntEnum
 from typing import List
+
+
+class CpType(IntEnum):
+    # CP type for ulysses parallelism
+    ULYSSES = 0
+    # CP type for helix parallelism
+    HELIX = 1
 
 
 class Mapping(object):
@@ -126,7 +134,7 @@ class Mapping(object):
             moe_ep_size=-1,  # -1 means no moe
             attn_tp_size=-1,
             attn_cp_size=-1,
-            kvp_size=1,  # Size of helix parallelism (sequence parallelism in gen)
+            cp_type=CpType.ULYSSES,
             auto_parallel=False,
             enable_attention_dp=False):
         # set default values for non-moe cases
@@ -134,53 +142,54 @@ class Mapping(object):
         if moe_cluster_size == -1:
             moe_cluster_size = 1
 
+        moe_world_size = tp_size if cp_type == CpType.ULYSSES else tp_size * cp_size
         if moe_tp_size == -1 and moe_ep_size == -1:
-            moe_tp_size = (tp_size * kvp_size) // moe_cluster_size
+            moe_tp_size = moe_world_size // moe_cluster_size
             moe_ep_size = 1
 
         elif moe_tp_size == -1:
-            moe_tp_size = (tp_size * kvp_size) // (moe_ep_size * moe_cluster_size)
+            moe_tp_size = moe_world_size // (moe_ep_size * moe_cluster_size)
 
         elif moe_ep_size == -1:
-            moe_ep_size = (tp_size * kvp_size) // (moe_tp_size * moe_cluster_size)
+            moe_ep_size = moe_world_size // (moe_tp_size * moe_cluster_size)
 
         if attn_tp_size == -1 and attn_cp_size == -1:
-            # fallback to ulysses
-            attn_tp_size = tp_size * cp_size
-            attn_cp_size = 1
+            if cp_type == CpType.ULYSSES:
+                # fallback to ulysses
+                attn_tp_size = tp_size * cp_size
+                attn_cp_size = 1
+            else:
+                # fallback to helix
+                attn_tp_size = tp_size
+                attn_cp_size = cp_size
 
         elif attn_tp_size == -1:
-            attn_tp_size = (cp_size * tp_size * kvp_size) // attn_cp_size
+            attn_tp_size = (tp_size * cp_size) // attn_cp_size
 
         elif attn_cp_size == -1:
-            attn_cp_size = (cp_size * tp_size * kvp_size) // attn_tp_size
+            attn_cp_size = (tp_size * cp_size) // attn_tp_size
 
-        if attn_cp_size != 1:
+        if attn_cp_size != 1 and cp_type == CpType.ULYSSES:
             raise ValueError(
-                f"attn_cp_size must be 1 for now, but got {attn_tp_size}, {attn_cp_size}."
-            )
-
-        if cp_size != 1 and kvp_size != 1:
-            raise ValueError(
-                f"Either cp_size or kvp_size must be 1 for now, but got {cp_size}, {kvp_size}."
+                f"attn_cp_size must be 1 for now for ulysses, but got {attn_tp_size}, {attn_cp_size}."
             )
 
         if auto_parallel:
-            if tp_size != 1 or pp_size != 1 or cp_size != 1 or kvp_size != 1:
+            if tp_size != 1 or pp_size != 1 or cp_size != 1:
                 raise ValueError(
-                    f"When auto parallel is enabled, tp_size, pp_size, cp_size, kvp_size must be 1, but got {tp_size}, {pp_size}, {cp_size}, {kvp_size}."
+                    f"When auto parallel is enabled, tp_size, pp_size, cp_size must be 1, but got {tp_size}, {pp_size}, {cp_size}."
                 )
         else:
-            if tp_size * pp_size * cp_size * kvp_size != world_size:
+            if tp_size * pp_size * cp_size != world_size:
                 raise ValueError(
-                    f"world_size must equal to tp_size * pp_size * cp_size * kvp_size, but got {world_size} != {tp_size} * {pp_size} * {cp_size} * {kvp_size}."
+                    f"world_size must equal to tp_size * pp_size * cp_size, but got {world_size} != {tp_size} * {pp_size} * {cp_size}."
                 )
 
         moe_tp_ep_size = moe_tp_size * moe_ep_size
         moe_tp_cluster_ep_size = moe_tp_ep_size * moe_cluster_size
-        if moe_tp_cluster_ep_size != tp_size * kvp_size:
+        if moe_tp_cluster_ep_size != moe_world_size:
             raise ValueError(
-                f"tp_size * kvp_size must equal to moe_tp_size * moe_ep_size * moe_cluster_size, but got {tp_size} * {kvp_size} != {moe_tp_size} * {moe_ep_size} * {moe_cluster_size}"
+                f"moe_tp_size * moe_ep_size * moe_cluster_size must equal to moe_world_size, but got {moe_tp_cluster_ep_size} != {moe_world_size}"
             )
 
         attn_tp_cp_size = attn_tp_size * attn_cp_size
@@ -189,8 +198,8 @@ class Mapping(object):
                 f"tp_size * cp_size must equal to attn_tp_size * attn_cp_size, but got {tp_size} * {cp_size} != {attn_tp_size} * {attn_cp_size}"
             )
 
-        if moe_ep_size != 1 and cp_size > 1:
-            raise NotImplementedError("CP don't support MoE tp/ep yet")
+        if moe_ep_size != 1 and cp_size > 1 and cp_type == CpType.ULYSSES:
+            raise NotImplementedError("CP ulsyses doesn't support MoE tp/ep yet")
 
         self.tp_size = tp_size
         self.cp_size = cp_size
@@ -201,7 +210,7 @@ class Mapping(object):
         self.moe_cluster_size = moe_cluster_size
         self.attn_tp_size = attn_tp_size
         self.attn_cp_size = attn_cp_size
-        self.kvp_size = kvp_size
+        self.cp_type = cp_type
         self.auto_parallel = auto_parallel
         self.world_size = world_size
         self.enable_attention_dp = enable_attention_dp
@@ -210,7 +219,6 @@ class Mapping(object):
         self.pp_groups = []
         self.cp_groups = []
         self.tp_groups = []
-        self.kvp_groups = []  # Groups for key-value parallelism
         self.moe_cluster_groups = []
         self.moe_tp_groups = []
         self.moe_ep_groups = []
@@ -236,14 +244,6 @@ class Mapping(object):
                 ranks = range(i * tp_size * cp_size + j * tp_size,
                               i * tp_size * cp_size + (j + 1) * tp_size)
                 self.tp_groups.append(list(ranks))
-
-        # init kvp group - similar to tp groups but for helix parallelism
-        for i in range(pp_size):
-            for j in range(cp_size):
-                for k in range(tp_size // kvp_size):
-                    start_rank = i * tp_size * cp_size + j * tp_size + k * kvp_size
-                    ranks = range(start_rank, start_rank + kvp_size)
-                    self.kvp_groups.append(list(ranks))
 
         # init moe tp group
         for i in range(pp_size):
@@ -287,7 +287,7 @@ class Mapping(object):
                 and self.moe_ep_size == other.moe_ep_size
                 and self.attn_tp_size == other.attn_tp_size
                 and self.attn_cp_size == other.attn_cp_size
-                and self.kvp_size == other.kvp_size
+                and self.cp_type == other.cp_type
                 and self.auto_parallel == other.auto_parallel)
 
     def __hash__(self):
@@ -303,7 +303,7 @@ class Mapping(object):
             self.moe_ep_size,
             self.attn_tp_size,
             self.attn_cp_size,
-            self.kvp_size,
+            self.cp_type,
             self.auto_parallel,
         ))
 
@@ -389,8 +389,14 @@ class Mapping(object):
     def local_rank(self):
         return self.rank % self.gpus_per_node
 
-    def has_cp(self):
-        return self.cp_size > 1
+    def has_cp_ulysses(self):
+        return self.cp_size > 1 and self.cp_type == CpType.ULYSSES
+
+    def has_cp_helix(self):
+        return self.cp_size > 1 and self.cp_type == CpType.HELIX
+
+    def is_last_helix_rank(self):
+        return self.cp_rank == self.cp_size - 1
 
     def get_node_rank(self, rank: int):
         return rank // self.gpus_per_node
@@ -437,12 +443,6 @@ class Mapping(object):
     def has_moe_ep(self):
         return self.moe_ep_size > 1
 
-    def has_kvp(self):
-        return self.kvp_size > 1
-
-    def is_last_kvp_rank(self):
-        return self.kvp_rank == self.kvp_size - 1
-
     def pp_layers(self, num_layers: int) -> List[int]:
         base_layers = num_layers // self.pp_size
         extra_layers = num_layers % self.pp_size
@@ -475,6 +475,6 @@ class Mapping(object):
             'moe_ep_size': self.moe_ep_size,
             'attn_tp_size': self.attn_tp_size,
             'attn_cp_size': self.attn_cp_size,
-            'kvp_size': self.kvp_size,
+            'cp_type': self.cp_type,
             'auto_parallel': self.auto_parallel,
         }

@@ -67,12 +67,12 @@ class Qwen3MoE(nn.Module):
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_dim)
 
-        all_rank_num_tokens = attn_metadata.all_rank_num_tokens
+        all_tp_rank_num_tokens = attn_metadata.all_tp_rank_num_tokens
         router_logits = self.gate(hidden_states)
         final_hidden_states = self.experts(
             hidden_states,
             router_logits,
-            all_rank_num_tokens=all_rank_num_tokens,
+            all_tp_rank_num_tokens=all_tp_rank_num_tokens,
             use_dp_padding=False)
 
         if not self.enable_attention_dp and self.mapping.tp_size > 1:
