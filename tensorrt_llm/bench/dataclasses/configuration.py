@@ -37,6 +37,14 @@ class RuntimeConfig(BaseModel):
     extra_llm_api_options: Optional[str] = None
     iteration_log: Optional[Path] = None
 
+    def _get_cp_config(self) -> Dict[str, Any]:
+        if self.world_config.cp_type == "ulysses":
+            return {"cp_type": CPType.Ulysses}
+        elif self.world_config.cp_type == "helix":
+            return {"cp_type": CPType.Helix}
+        else:
+            raise ValueError(f"Invalid context parallelism type: {self.world_config.cp_type}")
+
     def get_llm_args(self) -> Dict:
         model = self.engine_dir or self.model_path or self.model
 
@@ -51,6 +59,10 @@ class RuntimeConfig(BaseModel):
             self.world_config.pp_size,
             "tensor_parallel_size":
             self.world_config.tp_size,
+            "context_parallel_size":
+            self.world_config.cp_size,
+            "cp_config":
+            self._get_cp_config(),
             "gpus_per_node":
             self.world_config.gpus_per_node,
             "moe_expert_parallel_size":
@@ -152,6 +164,8 @@ class DecodingConfig(BaseModel):
 class ExecutorWorldConfig(BaseModel):
     pp_size: int = 1
     tp_size: int = 1
+    cp_size: int = 1
+    cp_type: Literal["ulysses", "helix"] = "ulysses"
     # None to make LLM-API deduce it with a rule.
     gpus_per_node: Optional[int] = None
     leader_mode: bool = False
@@ -163,13 +177,13 @@ class ExecutorWorldConfig(BaseModel):
         if self.gpus_per_node is None:
             return self
 
-        parallel_world = self.pp_size * self.tp_size
+        parallel_world = self.pp_size * self.tp_size * self.cp_size
         num_gpus = self.world_size * self.gpus_per_node
         valid_world = bool(num_gpus >= parallel_world)
 
         if not valid_world:
             raise ValueError(
-                f"World configuration is invalid, TP * PP ({parallel_world})"
+                f"World configuration is invalid, TP * PP * CP ({parallel_world})"
                 "does not equal the total number of available GPUs"
                 f"({num_gpus}).")
 
@@ -177,7 +191,7 @@ class ExecutorWorldConfig(BaseModel):
 
     @property
     def world_size(self) -> int:
-        return self.pp_size * self.tp_size
+        return self.pp_size * self.tp_size * self.cp_size
 
     def _get_tensorrt_llm_executor_worker_path(self) -> Path:
         module_path = find_spec("tensorrt_llm").loader.get_filename()
