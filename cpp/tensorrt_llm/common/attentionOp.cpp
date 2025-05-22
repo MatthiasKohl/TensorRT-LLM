@@ -983,7 +983,7 @@ int AttentionOp::mlaGeneration(
         tllmRunnerParams.oSfPtr = generation_params.context_buf_sf;
 
         // softmax stats if needed
-        tllmRunnerParams.softmaxStatsPtr = generation_params.softmax_stats;
+        tllmRunnerParams.softmaxStatsPtr = reinterpret_cast<float2*>(generation_params.softmax_stats);
 
         // MLA uses different head dimensions for Qk and V.
         tllmRunnerParams.mHeadDimQk = mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim;
