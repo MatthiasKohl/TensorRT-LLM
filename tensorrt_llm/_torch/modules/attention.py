@@ -13,7 +13,7 @@ from ..attention_backend import (AttentionInputType, AttentionMetadata,
 from ..attention_backend.interface import (PositionalEmbeddingParams,
                                            PredefinedAttentionMask, AttentionBackend)
 from ..attention_backend.utils import create_attention, get_attention_backend
-from ..distributed import AllReduceParams
+from ..distributed import AllReduceParams, cp_allgather
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
 from ..utils import get_model_extra_attrs
@@ -407,12 +407,13 @@ class MLA(nn.Module):
 
         # tensor parallel
         config = config or ModelConfig()
-        tp_size = config.mapping.tp_size
-        pp_size = config.mapping.pp_size
-        cp_size = config.mapping.cp_size
-        if config.mapping.enable_attention_dp:
+        self.mapping = config.mapping
+        tp_size = self.mapping.tp_size
+        pp_size = self.mapping.pp_size
+        cp_size = self.mapping.cp_size
+        if self.mapping.enable_attention_dp:
             tp_size = 1
-        if config.mapping.has_cp_ulysses():
+        if self.mapping.has_cp_ulysses():
             raise NotImplementedError("MLA doesn't support CP Ulyssees yet")
 
         mapping = Mapping(
@@ -420,10 +421,10 @@ class MLA(nn.Module):
             tp_size=tp_size,
             pp_size=pp_size,
             cp_size=cp_size,
-            rank=config.mapping.rank,
-            gpus_per_node=config.mapping.gpus_per_node,
-            enable_attention_dp=config.mapping.enable_attention_dp,
-            cp_config=config.mapping.cp_config,
+            rank=self.mapping.rank,
+            gpus_per_node=self.mapping.gpus_per_node,
+            enable_attention_dp=self.mapping.enable_attention_dp,
+            cp_config=self.mapping.cp_config,
         )
 
         assert self.num_heads % tp_size == 0
@@ -435,10 +436,6 @@ class MLA(nn.Module):
         quant_config = config.get_quant_config()
         self.quant_config = quant_config
 
-        self.cp_size = config.mapping.cp_size
-        self.cp_group = config.mapping.cp_group
-        self.cp_rank = config.mapping.cp_rank
-        self.cp_type = config.mapping.cp_config.get("cp_type", CpType.HELIX)
         if not self.is_lite:
             self.fused_a = Linear(
                 hidden_size,
@@ -648,7 +645,7 @@ class MLA(nn.Module):
         return k_pe
 
     def _attn_forward(self, attn_instance: AttentionBackend, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, attn_metadata: AttentionMetadata, **kwargs):
-        if self.cp_size > 1 and self.cp_type == CpType.HELIX:
+        if self.mapping.cp_size > 1 and self.mapping.cp_config.get("cp_type") == CpType.HELIX:
             # partial_o: [num_tokens, num_heads * v_head_dim]
             # softmax_stats: [num_tokens, num_heads, 2]
             partial_o, softmax_stats = attn_instance.forward(
@@ -656,16 +653,20 @@ class MLA(nn.Module):
                 compute_attention_stats=True,
                 **kwargs
             )
+            print(f"partial_o: {partial_o.shape}")
+            print(f"softmax_stats: {softmax_stats.shape}")
             # this is the post-processing of helix parallel attention,
             # similar to the post-processing of ring attention
             v_head_dim = partial_o.shape[-1] // softmax_stats.shape[1]
-            all_gathered = self.dist.cp_allgather([partial_o, softmax_stats])
+            all_gathered = cp_allgather([partial_o, softmax_stats], self.mapping, dim=0)
             # [num_tokens, num_heads * v_head_dim] -> [cp_size, num_tokens, num_heads * v_head_dim]
-            gathered_o = torch.stack([item[0] for item in all_gathered], dim=0)
+            gathered_o = all_gathered[0].view(self.mapping.cp_size, *partial_o.shape)
             # [num_tokens, num_heads, 2] -> [cp_size, num_tokens, num_heads, 2]
-            gathered_stats = torch.stack([item[1] for item in all_gathered], dim=0)
+            gathered_stats = all_gathered[1].view(self.mapping.cp_size, *softmax_stats.shape)
+            print(f"gathered_o: {gathered_o.shape}")
+            print(f"gathered_stats: {gathered_stats.shape}")
             # [cp_size, num_tokens, num_heads] -> [1, num_tokens, num_heads]
-            global_max = torch.max(gathered_stats[..., 0], dim=0, keepdim=True)
+            global_max = torch.max(gathered_stats[..., 0], dim=0, keepdim=True)[0]
             # [cp_size, num_tokens, num_heads]
             corrected_max = gathered_stats[..., 0] - global_max
             corrected_max_exp = torch.exp(corrected_max)
@@ -673,11 +674,16 @@ class MLA(nn.Module):
             # [cp_size, num_tokens, num_heads] -> [1, num_tokens, num_heads]
             global_sum = torch.sum(corrected_sum, dim=0, keepdim=True)
             # [cp_size, num_tokens, num_heads] -> [cp_size, num_tokens, num_heads, 1]
+            print(f"corrected_max_exp: {corrected_max_exp.shape}")
+            print(f"global_sum: {global_sum.shape}")
             correction = torch.unsqueeze(corrected_max_exp / global_sum, -1)
+            print(f"correction: {correction.shape}")
             # [cp_size, num_tokens, num_heads, 1] -> [cp_size, num_tokens, num_heads, v_head_dim]
             correction = correction.expand(corrected_max_exp.shape + (v_head_dim,))
+            print(f"correction: {correction.shape}")
             # [cp_size, num_tokens, num_heads, v_head_dim] -> [cp_size, num_tokens, num_heads * v_head_dim]
-            correction = correction.reshape(gathered_o.shape)
+            correction = correction.view(gathered_o.shape[:-1], -1)
+            print(f"correction: {correction.shape}")
             # [cp_size, num_tokens, num_heads * v_head_dim]
             corrected_o = gathered_o * correction
             # [cp_size, num_tokens, num_heads * v_head_dim] -> [num_tokens, num_heads * v_head_dim]
