@@ -15,7 +15,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_manager import (LoraConfig,
                                        get_default_trtllm_modules_to_hf_modules,
                                        load_torch_hf_lora)
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.mapping import CpType, Mapping
 
 from ..speculative import get_spec_decoder
 from .config_utils import is_mla, is_nemotron_hybrid
@@ -459,7 +459,7 @@ def instantiate_sampler(model_engine: PyTorchModelEngine,
                         executor_config: ExecutorConfig,
                         pytorch_backend_config: PyTorchConfig,
                         mapping: Mapping):
-    if mapping.cp_config.get('cp_type') == 'star_attention':
+    if mapping.cp_config.get('cp_type') == CpType.STAR:
         assert pytorch_backend_config.attn_backend == "FLASHINFER_STAR_ATTENTION", "attention backend of star attention should be 'FLASHINFER_STAR_ATTENTION'"
         sampler = TorchStarAttentionSampler(
             max_seq_len=model_engine.max_seq_len)

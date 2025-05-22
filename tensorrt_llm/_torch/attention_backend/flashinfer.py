@@ -453,7 +453,13 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                 metadata: FlashInferAttentionMetadata,
                 *,
                 attention_mask: AttentionMask = PredefinedAttentionMask.CAUSAL,
+                compute_attention_stats: bool = False,
                 **kwargs) -> torch.Tensor:
+        if compute_attention_stats:
+            raise NotImplementedError(
+                "FlashInferAttention does not support compute_attention_stats yet."
+            )
+
         if attention_mask == PredefinedAttentionMask.CAUSAL:
             attention_mask_type = int(AttentionMaskType.causal)
             attention_mask_data = None

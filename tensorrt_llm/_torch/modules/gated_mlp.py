@@ -56,11 +56,13 @@ class GatedMLP(nn.Module):
             pp_size = config.mapping.pp_size
 
         mapping = Mapping(
-            world_size=tp_size * pp_size,
+            world_size=tp_size * pp_size * self.mapping.cp_size,
             rank=self.mapping.rank,
             gpus_per_node=self.mapping.gpus_per_node,
             tp_size=tp_size,
             pp_size=pp_size,
+            cp_size=self.mapping.cp_size,
+            cp_config=self.mapping.cp_config,
         )
 
         self.gate_up_proj = Linear(
@@ -107,13 +109,13 @@ class GatedMLP(nn.Module):
     def forward(
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
-        all_rank_num_tokens=None,
+        all_tp_rank_num_tokens=None,
         final_all_reduce_params: Optional[AllReduceParams] = None,
         lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor:
         if bool(lora_params):
-            return self.forward_lora(x, all_rank_num_tokens,
+            return self.forward_lora(x, all_tp_rank_num_tokens,
                                      final_all_reduce_params, lora_params)
 
         if self.activation == F.silu:
@@ -132,7 +134,7 @@ class GatedMLP(nn.Module):
     def forward_lora(
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
-        all_rank_num_tokens=None,
+        all_tp_rank_num_tokens=None,
         final_all_reduce_params: Optional[AllReduceParams] = None,
         lora_params: Optional[dict] = None,
     ) -> torch.Tensor:

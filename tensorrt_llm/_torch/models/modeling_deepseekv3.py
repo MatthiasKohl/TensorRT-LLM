@@ -455,7 +455,7 @@ class Deepseekv3MoE(nn.Module):
         return True
 
     def compute_routed_output(self, hidden_states, hidden_states_fp4,
-                              all_rank_num_tokens, cutlass_min_latency_mode):
+                              all_tp_rank_num_tokens, cutlass_min_latency_mode):
         # max-throughput
         use_dp_padding = False
         if self.use_dp and self.mapping.tp_size > 1:
@@ -465,24 +465,25 @@ class Deepseekv3MoE(nn.Module):
                 hidden_states = allgather(hidden_states,
                                           self.mapping,
                                           dim=0,
-                                          sizes=all_rank_num_tokens)
+                                          sizes=all_tp_rank_num_tokens)
             elif not self.experts.is_cutlass() or (not self.experts.has_fp8_qdq
                                                    and self.experts.has_nvfp4):
                 # Use padding when not using the cutlass path or when x_sf in self.experts is not None
                 use_dp_padding = True
-                max_num_token = max(all_rank_num_tokens)
+                max_num_token = max(all_tp_rank_num_tokens)
                 hidden_states = torch.nn.functional.pad(
                     hidden_states,
                     (0, 0, 0, max_num_token - hidden_states.shape[0]))
 
         router_logits = self.gate(hidden_states)
 
-        routed_output = self.experts(hidden_states_fp4 or hidden_states,
-                                     router_logits,
-                                     cutlass_min_latency_mode,
-                                     output_dtype=hidden_states.dtype,
-                                     all_rank_num_tokens=all_rank_num_tokens,
-                                     use_dp_padding=use_dp_padding)
+        routed_output = self.experts(
+            hidden_states_fp4 or hidden_states,
+            router_logits,
+            cutlass_min_latency_mode,
+            output_dtype=hidden_states.dtype,
+            all_tp_rank_num_tokens=all_tp_rank_num_tokens,
+            use_dp_padding=use_dp_padding)
 
         return routed_output
 
@@ -490,7 +491,7 @@ class Deepseekv3MoE(nn.Module):
         self,
         hidden_states: torch.Tensor,
         hidden_states_fp4: Optional[Fp4QuantizedTensor] = None,
-        all_rank_num_tokens: Optional[list[int]] = None,
+        all_tp_rank_num_tokens: Optional[list[int]] = None,
         final_all_reduce_params: Optional[AllReduceParams] = None,
         cutlass_min_latency_mode: Optional[bool] = False,
     ) -> torch.Tensor:
@@ -506,7 +507,7 @@ class Deepseekv3MoE(nn.Module):
 
         def _compute_routed_output():
             routed_output = self.compute_routed_output(
-                hidden_states, hidden_states_fp4, all_rank_num_tokens,
+                hidden_states, hidden_states_fp4, all_tp_rank_num_tokens,
                 cutlass_min_latency_mode)
             return routed_output
 
@@ -699,7 +700,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             return self.mlp(
                 hidden_states,
                 hidden_states_fp4,
-                all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
+                all_tp_rank_num_tokens=attn_metadata.all_tp_rank_num_tokens,
                 final_all_reduce_params=AllReduceParams(
                     enable_allreduce=not (self.fusion_config.POST_MOE_FUSION
                                           or self.mapping.tp_size == 1)),
@@ -904,7 +905,7 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
         # MoE
         hidden_states = self.mlp(
             hidden_states,
-            all_rank_num_tokens=spec_metadata.all_rank_num_tokens,
+            all_tp_rank_num_tokens=spec_metadata.all_tp_rank_num_tokens,
             final_all_reduce_params=AllReduceParams(
                 enable_allreduce=not (self.fusion_config.POST_MOE_FUSION
                                       or self.mapping.tp_size == 1)),

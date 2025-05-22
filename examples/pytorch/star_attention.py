@@ -9,6 +9,7 @@ import torch
 from tensorrt_llm import SamplingParams
 from tensorrt_llm._torch import LLM
 from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
+from tensorrt_llm.mapping import CpType
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 
@@ -61,7 +62,7 @@ def generate_llm_outputs(args, data, fp8=False, fp8_kv_cache=False):
                                kv_cache_quant_algo=QuantAlgo.FP8 if fp8_kv_cache
                                else None) if fp8 else QuantConfig()
     cp_config = {
-        "cp_type": "star_attention",
+        "cp_type": CpType.STAR,
         "cp_anchor_size": args.sa_anchor_size,
         "block_size": args.sa_block_size
     }
