@@ -1846,17 +1846,15 @@ class PyTorchModelEngine(ModelEngine):
             attn_metadata: AttentionMetadata,
             spec_metadata: Optional[SpecMetadata] = None,
             new_tensors_device: Optional[SampleStateTensors] = None):
-        if self.mapping is not None and 'cp_type' in self.mapping.cp_config:
-            cp_type = self.mapping.cp_config['cp_type']
-            if cp_type == CpType.STAR:
-                return self._prepare_star_attention_inputs(
-                    scheduled_requests, kv_cache_manager, attn_metadata)
-            else:
-                assert False, f'Unsupported cp_type {cp_type}'
-        else:
+        cp_type = None if self.mapping is None else self.mapping.cp_config.get("cp_type", None)
+        if cp_type is None or cp_type == CpType.HELIX:
             return self._prepare_tp_inputs(scheduled_requests, kv_cache_manager,
                                            attn_metadata, spec_metadata,
                                            new_tensors_device)
+        if cp_type == CpType.STAR:
+            return self._prepare_star_attention_inputs(
+                scheduled_requests, kv_cache_manager, attn_metadata)
+        assert False, f"Unsupported cp_type {cp_type.name}"
 
     @torch.inference_mode()
     @with_model_extra_attrs(lambda self: self.model.extra_attrs)

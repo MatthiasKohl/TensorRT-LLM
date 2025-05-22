@@ -306,7 +306,8 @@ class Mapping(object):
             self.moe_ep_size,
             self.attn_tp_size,
             self.attn_cp_size,
-            self.cp_config,
+            # note: we do not allow updating cp_config after initialization
+            tuple(sorted(self.cp_config.items())),
             self.auto_parallel,
         ))
 

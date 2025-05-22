@@ -17,6 +17,7 @@ from tensorrt_llm.llmapi import (BatchingType, CapacitySchedulerPolicy,
                                  SchedulerConfig)
 from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_options
 from tensorrt_llm.models.modeling_utils import SpeculativeDecodingMode
+from tensorrt_llm.mapping import CpType
 
 SPECULATIVE_MAP = {
     SpeculativeDecodingMode.NONE: lambda *args: None,
@@ -39,9 +40,9 @@ class RuntimeConfig(BaseModel):
 
     def _get_cp_config(self) -> Dict[str, Any]:
         if self.world_config.cp_type == "ulysses":
-            return {"cp_type": CPType.Ulysses}
+            return {"cp_type": CpType.ULYSSES}
         elif self.world_config.cp_type == "helix":
-            return {"cp_type": CPType.Helix}
+            return {"cp_type": CpType.HELIX}
         else:
             raise ValueError(f"Invalid context parallelism type: {self.world_config.cp_type}")
 

@@ -56,11 +56,13 @@ class GatedMLP(nn.Module):
             pp_size = config.mapping.pp_size
 
         mapping = Mapping(
-            world_size=tp_size * pp_size,
+            world_size=tp_size * pp_size * self.mapping.cp_size,
             rank=self.mapping.rank,
             gpus_per_node=self.mapping.gpus_per_node,
             tp_size=tp_size,
             pp_size=pp_size,
+            cp_size=self.mapping.cp_size,
+            cp_config=self.mapping.cp_config,
         )
 
         self.gate_up_proj = Linear(

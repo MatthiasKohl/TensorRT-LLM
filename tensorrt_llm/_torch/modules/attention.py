@@ -6,7 +6,7 @@ from typing import Optional, cast
 import torch
 from torch import nn
 
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.mapping import Mapping, CpType
 
 from ..attention_backend import (AttentionInputType, AttentionMetadata,
                                  TrtllmAttention, TrtllmAttentionMetadata)
@@ -93,9 +93,11 @@ class Attention(nn.Module):
             tp_size = 1
 
         mapping = Mapping(
-            world_size=tp_size * pp_size,
+            world_size=tp_size * pp_size * config.mapping.cp_size,
             tp_size=tp_size,
             pp_size=pp_size,
+            cp_size=config.mapping.cp_size,
+            cp_config=config.mapping.cp_config,
             rank=config.mapping.rank,
             gpus_per_node=config.mapping.gpus_per_node,
             enable_attention_dp=config.mapping.enable_attention_dp,
@@ -410,11 +412,11 @@ class MLA(nn.Module):
         cp_size = config.mapping.cp_size
         if config.mapping.enable_attention_dp:
             tp_size = 1
-        if config.mapping.cp_type == CpType.ULYSSES and cp_size > 1:
+        if config.mapping.has_cp_ulysses():
             raise NotImplementedError("MLA doesn't support CP Ulyssees yet")
 
         mapping = Mapping(
-            world_size=cp_size * tp_size * pp_size,
+            world_size=tp_size * pp_size * cp_size,
             tp_size=tp_size,
             pp_size=pp_size,
             cp_size=cp_size,
@@ -436,7 +438,7 @@ class MLA(nn.Module):
         self.cp_size = config.mapping.cp_size
         self.cp_group = config.mapping.cp_group
         self.cp_rank = config.mapping.cp_rank
-        self.cp_type = config.mapping.cp_config['cp_type']
+        self.cp_type = config.mapping.cp_config.get("cp_type", CpType.HELIX)
         if not self.is_lite:
             self.fused_a = Linear(
                 hidden_size,

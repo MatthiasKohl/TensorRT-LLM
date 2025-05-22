@@ -1458,7 +1458,7 @@ class PyExecutor:
             elif cp_type == CpType.RING:
                 raise NotImplementedError("Ring attention not implemented yet")
             else:
-                raise NotImplementedError(f'Unsupported cp type {cp_type}')
+                raise NotImplementedError(f"Unsupported cp type {cp_type.name}")
         else:
             ret = self._merge_tp_requests(new_requests)
         return ret
@@ -1641,7 +1641,7 @@ class PyExecutor:
             if cp_type == CpType.STAR:
                 self._update_request_states_star_attention(scheduled_requests)
             else:
-                assert False, f'Unsupported cp_type {cp_type}'
+                assert False, f"Unsupported cp_type {cp_type.name}"
         else:
             self._update_request_states_tp(scheduled_requests)
 
