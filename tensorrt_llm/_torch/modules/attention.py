@@ -652,7 +652,7 @@ class MLA(nn.Module):
             # partial_o: [num_tokens, num_heads * v_head_dim]
             # softmax_stats: [num_tokens, num_heads, 2]
             partial_o, softmax_stats = attn_instance.forward(
-                *args,
+                q, k, v, attn_metadata,
                 compute_attention_stats=True,
                 **kwargs
             )
@@ -684,7 +684,7 @@ class MLA(nn.Module):
             attn_output = torch.sum(corrected_o, dim=0)
             return attn_output
         else:
-            return attn_instance.forward(*args, **kwargs)
+            return attn_instance.forward(q, k, v, attn_metadata, **kwargs)
 
     def forward_impl_fake(self, hidden_states: torch.Tensor):
         num_tokens = hidden_states.shape[0]

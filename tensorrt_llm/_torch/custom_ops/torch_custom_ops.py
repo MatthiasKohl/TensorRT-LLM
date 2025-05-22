@@ -436,7 +436,7 @@ def attention(
         output = q.new_empty((num_tokens, num_heads * v_head_size), dtype=out_dtype)
         stats = q.new_empty((num_tokens, num_heads, 2), dtype=torch.float32)
         torch.ops.trtllm.attention_inplace(
-            q, k, v, output, stats, out_dtype, workspace, sequence_length,
+            q, k, v, output, out_dtype, workspace, sequence_length,
             host_past_key_value_lengths, context_lengths, host_context_lengths,
             host_request_types, kv_cache_block_offsets, host_kv_cache_block_offsets,
             host_kv_cache_pool_pointers, host_kv_cache_pool_mapping,
