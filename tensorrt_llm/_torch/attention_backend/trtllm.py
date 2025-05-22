@@ -394,6 +394,8 @@ class TrtllmAttentionWrapper:
             self.mla_context_kv_cache_block_offsets,
             compute_attention_stats,
         )
+        if len(output) == 1:
+            output = output[0]
         # reset the planned states (especially tensors) to avoid memory leak
         self.plan()
         return output

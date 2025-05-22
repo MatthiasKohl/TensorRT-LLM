@@ -178,7 +178,7 @@ from tensorrt_llm.sampling_params import SamplingParams
     help="context parallelism size",
 )
 @optgroup.option(
-    "--cp-type",
+    "--cp_type",
     type=click.Choice(["ulysses", "helix"]),
     default=None,
     help="context parallelism type",

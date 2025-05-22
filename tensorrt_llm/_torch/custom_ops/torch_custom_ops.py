@@ -422,7 +422,7 @@ def attention(
     mla_context_paged_kv: Optional[torch.Tensor],
     mla_context_kv_cache_block_offsets: Optional[torch.Tensor],
     compute_attention_stats: bool,
-) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
+) -> List[torch.Tensor]:
     num_tokens = q.size(0)
     attention_input_type = (AttentionInputType(attention_input_type)
                             if attention_input_type is not None else
@@ -455,7 +455,7 @@ def attention(
             v_head_dim, mrope_rotary_cos_sin, mrope_position_deltas,
             mla_context_paged_kv, mla_context_kv_cache_block_offsets, stats
         )
-        return output, stats
+        return [output, stats]
     else:
         output = q.new_empty((num_tokens, num_heads * v_head_size), dtype=out_dtype)
         torch.ops.trtllm.attention_inplace(
@@ -477,7 +477,9 @@ def attention(
             q_lora_rank, kv_lora_rank, qk_nope_head_dim, qk_rope_head_dim,
             v_head_dim, mrope_rotary_cos_sin, mrope_position_deltas,
             mla_context_paged_kv, mla_context_kv_cache_block_offsets, None)
-        return output
+        # note: must return a list of tensors because custom ops do not allow
+        # a union of types as return type
+        return [output]
 
 
 @attention.register_fake

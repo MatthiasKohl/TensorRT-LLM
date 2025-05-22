@@ -11,7 +11,7 @@ from tensorrt_llm.mapping import Mapping
 from ..attention_backend import (AttentionInputType, AttentionMetadata,
                                  TrtllmAttention, TrtllmAttentionMetadata)
 from ..attention_backend.interface import (PositionalEmbeddingParams,
-                                           PredefinedAttentionMask)
+                                           PredefinedAttentionMask, AttentionBackend)
 from ..attention_backend.utils import create_attention, get_attention_backend
 from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
