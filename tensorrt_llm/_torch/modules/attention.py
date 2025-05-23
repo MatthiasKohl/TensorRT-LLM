@@ -653,8 +653,6 @@ class MLA(nn.Module):
                 compute_attention_stats=True,
                 **kwargs
             )
-            print(f"partial_o: {partial_o.shape}")
-            print(f"softmax_stats: {softmax_stats.shape}")
             # this is the post-processing of helix parallel attention,
             # similar to the post-processing of ring attention
             v_head_dim = partial_o.shape[-1] // softmax_stats.shape[1]
@@ -663,8 +661,6 @@ class MLA(nn.Module):
             gathered_o = all_gathered[0].view(self.mapping.cp_size, *partial_o.shape)
             # [num_tokens, num_heads, 2] -> [cp_size, num_tokens, num_heads, 2]
             gathered_stats = all_gathered[1].view(self.mapping.cp_size, *softmax_stats.shape)
-            print(f"gathered_o: {gathered_o.shape}")
-            print(f"gathered_stats: {gathered_stats.shape}")
             # [cp_size, num_tokens, num_heads] -> [1, num_tokens, num_heads]
             global_max = torch.max(gathered_stats[..., 0], dim=0, keepdim=True)[0]
             # [cp_size, num_tokens, num_heads]
@@ -674,21 +670,12 @@ class MLA(nn.Module):
             # [cp_size, num_tokens, num_heads] -> [1, num_tokens, num_heads]
             global_sum = torch.sum(corrected_sum, dim=0, keepdim=True)
             # [cp_size, num_tokens, num_heads] -> [cp_size, num_tokens, num_heads, 1]
-            print(f"corrected_max_exp: {corrected_max_exp.shape}")
-            print(f"global_sum: {global_sum.shape}")
             correction = torch.unsqueeze(corrected_max_exp / global_sum, -1)
-            print(f"correction: {correction.shape}")
-            # [cp_size, num_tokens, num_heads, 1] -> [cp_size, num_tokens, num_heads, v_head_dim]
-            correction = correction.expand(corrected_max_exp.shape + (v_head_dim,))
-            print(f"correction: {correction.shape}")
-            # [cp_size, num_tokens, num_heads, v_head_dim] -> [cp_size, num_tokens, num_heads * v_head_dim]
-            correction = correction.view(gathered_o.shape[:-1], -1)
-            print(f"correction: {correction.shape}")
-            # [cp_size, num_tokens, num_heads * v_head_dim]
-            corrected_o = gathered_o * correction
-            # [cp_size, num_tokens, num_heads * v_head_dim] -> [num_tokens, num_heads * v_head_dim]
-            attn_output = torch.sum(corrected_o, dim=0)
-            return attn_output
+            # [cp_size, num_tokens, num_heads, v_head_dim]
+            corrected_o = gathered_o.view(*correction.shape[:-1], v_head_dim) * correction
+            # [cp_size, num_tokens, num_heads, v_head_dim] -> [num_tokens, num_heads * v_head_dim]
+            attn_output = torch.sum(corrected_o.view(*gathered_o.shape), dim=0)
+            return attn_output.to(dtype=gathered_o.dtype)
         else:
             return attn_instance.forward(q, k, v, attn_metadata, **kwargs)
 
