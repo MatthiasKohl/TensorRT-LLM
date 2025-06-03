@@ -106,6 +106,8 @@ public:
         // optional when cross attention
         int32_t const* encoder_input_lengths = nullptr;
         int64_t const* runtime_perf_knobs = nullptr;
+        // optional when compute attention stats
+        float* softmax_stats = nullptr;
     };
 
     template <typename T>

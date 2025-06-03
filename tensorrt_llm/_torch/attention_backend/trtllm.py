@@ -1,7 +1,7 @@
 import os
 import weakref
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Tuple, Union
 
 import torch
 
@@ -253,6 +253,7 @@ class TrtllmAttentionWrapper:
         is_fused_qkv: bool = True,
         update_kv_cache: bool = True,
         attention_mask: AttentionMask = PredefinedAttentionMask.CAUSAL,
+        compute_attention_stats: bool = False,
     ):
         """
         Run the attention operation.
@@ -264,6 +265,7 @@ class TrtllmAttentionWrapper:
             is_fused_qkv (bool): Whether QKV tensor is provided.
             update_kv_cache (bool): Whether KV cache is updated.
             attention_mask (AttentionMask): Attention mask. See definition of AttentionMask for accepted types. Defaults to predefined causal mask.
+            compute_attention_stats (bool): Whether to output local attention statistics. Defaults to False.
         Returns:
             torch.Tensor with shape (num_tokens, num_heads * head_dim).
         """
@@ -400,6 +402,7 @@ class TrtllmAttentionWrapper:
             self.mla_context_paged_kv,
             self.mla_context_kv_cache_block_offsets,
             self.attention_chunk_size,
+            compute_attention_stats,
         )
         # reset the planned states (especially tensors) to avoid memory leak
         self.plan()
@@ -799,8 +802,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         attention_window_size: Optional[int] = None,
         mla_context_paged_kv: Optional[torch.Tensor] = None,
         mla_context_kv_cache_block_offsets: Optional[torch.Tensor] = None,
+        compute_attention_stats: bool = False,
         **kwargs,
-    ) -> torch.Tensor:
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         assert isinstance(
             metadata,
             TrtllmAttentionMetadata,
@@ -874,18 +878,24 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 # TODO(qijun): revisit fp8_context_fmha logic
                 out_dtype = torch.float8_e4m3fn
 
-        output_act, output_sf = self.wrapper.run(
+        output_act, output_sf, output_stats = self.wrapper.run(
             q,
             k,
             v,
             out_dtype=out_dtype,
             is_fused_qkv=not metadata.is_cross and k is None,
             update_kv_cache=not metadata.is_cross or k is not None,
-            attention_mask=attention_mask)
+            attention_mask=attention_mask,
+            compute_attention_stats=compute_attention_stats)
 
-        if out_dtype == torch.uint8:
+        if out_dtype == torch.uint8 and compute_attention_stats:
+            return Fp4QuantizedTensor(output_act, output_sf), output_stats
+        elif out_dtype == torch.uint8:
             return Fp4QuantizedTensor(output_act, output_sf)
-        return output_act
+        elif compute_attention_stats:
+            return output_act, output_stats
+        else:
+            return output_act
 
     @classmethod
     def support_fused_rope(cls) -> bool:

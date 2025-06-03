@@ -171,6 +171,18 @@ from tensorrt_llm.sampling_params import SamplingParams
     default=None,
     help="expert cluster parallelism size",
 )
+@optgroup.option(
+    "--cp",
+    type=int,
+    default=None,
+    help="context parallelism size",
+)
+@optgroup.option(
+    "--cp_type",
+    type=click.Choice(["ulysses", "helix"]),
+    default=None,
+    help="context parallelism type",
+)
 @optgroup.group("Request Load Control Options",
                 cls=MutuallyExclusiveOptionGroup,
                 help="Limits how requests are loaded.")
