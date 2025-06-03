@@ -306,15 +306,9 @@ class PyTorchModelEngine(ModelEngine):
     ):
         self.ub_buffers = None
         self.batch_size = batch_size
-        self.max_num_tokens = (max_num_tokens + mapping.attn_cp_size -
-                               1) // mapping.attn_cp_size
-        self.max_seq_len = (max_seq_len + mapping.attn_cp_size -
-                            1) // mapping.attn_cp_size
+        self.max_num_tokens = max_num_tokens
+        self.max_seq_len = max_seq_len
         if mapping.has_cp_helix():
-            logger.info(
-                f"CP size: {mapping.attn_cp_size}. Updated max num tokens: {self.max_num_tokens}"
-                f" (was {max_num_tokens}), max seq len: {self.max_seq_len} (was {max_seq_len})"
-            )
             self.has_cp_helix = True
         else:
             self.has_cp_helix = False
@@ -592,7 +586,7 @@ class PyTorchModelEngine(ModelEngine):
 
         # TODO: current warmup_request is not suitable for star attention
         cp_type = self.mapping.cp_config.get('cp_type', None)
-        if cp_type == CpType.STAR:
+        if cp_type == CpType.STAR or cp_type == CpType.HELIX:
             return
 
         with contextlib.ExitStack() as stack:
@@ -994,13 +988,7 @@ class PyTorchModelEngine(ModelEngine):
             logger.info(
                 f"max_seq_len is not specified, using inferred value {inferred_max_seq_len}"
             )
-            self.max_seq_len = (inferred_max_seq_len + self.mapping.attn_cp_size
-                                - 1) // self.mapping.attn_cp_size
-            if self.has_cp_helix:
-                logger.info(
-                    f"Updated max seq len from inferred value ({inferred_max_seq_len}) to "
-                    f"{self.max_seq_len} due to CP size {self.mapping.attn_cp_size}"
-                )
+            self.max_seq_len = inferred_max_seq_len
 
     def _init_max_num_tokens(self):
         # Modified from tensorrt_llm/_common.py check_max_num_tokens
@@ -1915,11 +1903,13 @@ class PyTorchModelEngine(ModelEngine):
             new_tensors_device: Optional[SampleStateTensors] = None):
         cp_type = None if self.mapping is None else self.mapping.cp_config.get(
             "cp_type", None)
-        if cp_type is None or cp_type == CpType.HELIX:
+        # TODO we need to support cp_type == CpType.HELIX with a custom implementation
+        # which combines some prep for tp inputs and star attention inputs
+        if cp_type is None:
             return self._prepare_tp_inputs(scheduled_requests, kv_cache_manager,
                                            attn_metadata, spec_metadata,
                                            new_tensors_device)
-        if cp_type == CpType.STAR:
+        if cp_type == CpType.STAR or cp_type == CpType.HELIX:
             return self._prepare_star_attention_inputs(scheduled_requests,
                                                        kv_cache_manager,
                                                        attn_metadata)

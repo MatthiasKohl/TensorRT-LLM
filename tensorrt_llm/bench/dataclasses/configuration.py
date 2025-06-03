@@ -42,7 +42,14 @@ class RuntimeConfig(BaseModel):
         if self.world_config.cp_type == "ulysses":
             return {"cp_type": CpType.ULYSSES}
         elif self.world_config.cp_type == "helix":
-            return {"cp_type": CpType.HELIX}
+            # assume that we have at least as many output tokens as input tokens
+            block_size = self.settings_config.max_num_tokens // (
+                self.world_config.cp_size * 2)
+            return {
+                "cp_type": CpType.HELIX,
+                "cp_anchor_size": block_size,
+                "block_size": block_size
+            }
         else:
             raise ValueError(
                 f"Invalid context parallelism type: {self.world_config.cp_type}"
