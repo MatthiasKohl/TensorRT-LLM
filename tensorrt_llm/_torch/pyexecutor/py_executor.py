@@ -27,6 +27,7 @@ from tensorrt_llm.bindings.executor import (DisServingRequestStats,
 from tensorrt_llm.bindings.internal.batch_manager import (LlmRequestType,
                                                           ReqIdsSet)
 from tensorrt_llm.logger import logger
+from tensorrt_llm.mapping import CpType
 
 from ..distributed import Distributed
 from .kv_cache_transceiver import KvCacheTransceiver
@@ -1368,12 +1369,21 @@ class PyExecutor:
         result = []
         for req_item in new_requests:
             req_id, exe_req, query_token_ids = req_item.id, req_item.request, req_item.query
+            print(
+                f"rank {self.dist.rank} req_item.id: {req_item.id}, exe_req.input_token_ids ({len(exe_req.input_token_ids)}): {exe_req.input_token_ids[:5]}..., query_token_ids ({-1 if query_token_ids is None else len(query_token_ids)}): {query_token_ids}"
+            )
             ctx_len0 = len(exe_req.input_token_ids)
             ctx_blocks, position_blocks, last_block_padding_num = [
                 exe_req.input_token_ids
             ], [[i for i in range(ctx_len0)]], 0
+            print(
+                f"rank {self.dist.rank} ctx_blocks ({len(ctx_blocks)} / {len(ctx_blocks[0])}): {ctx_blocks[0][:5]}..., position_blocks ({len(position_blocks)} / {len(position_blocks[0])}): {position_blocks[0][:5]}..., last_block_padding_num: {last_block_padding_num}"
+            )
             ctx_blocks, position_blocks, last_block_padding_num = self._partition_context(
                 exe_req.input_token_ids)
+            print(
+                f"rank {self.dist.rank} ctx_blocks ({len(ctx_blocks)} / {len(ctx_blocks[0])}): {ctx_blocks[0][:5]}..., position_blocks ({len(position_blocks)} / {len(position_blocks[0])}): {position_blocks[0][:5]}..., last_block_padding_num: {last_block_padding_num}"
+            )
             if self.dist.cp_rank == self.dist.cp_size - 1 and last_block_padding_num > 0:
                 ctx_blocks[-1] = ctx_blocks[-1][:-last_block_padding_num]
                 position_blocks[-1] = position_blocks[
@@ -1388,9 +1398,12 @@ class PyExecutor:
             # insert the dummy block to align the number of ctx iterations of each rank
             block_size = self.dist.cp_config['block_size']
             total_blocks = (ctx_len0 + block_size - 1) // block_size
-            num_blocks_per_rank = (
-                total_blocks + self.dist.cp_size -
-                1) // self.dist.cp_size + 1  # 1 for query block
+            num_blocks_per_rank = (total_blocks + self.dist.cp_size -
+                                   1) // self.dist.cp_size
+            num_blocks_per_rank += 1 if query_token_ids else 0  # 1 for query block
+            print(
+                f"rank {self.dist.rank} total_blocks: {total_blocks}, num_blocks_per_rank: {num_blocks_per_rank}"
+            )
             if len(ctx_blocks) == num_blocks_per_rank:
                 ctx_blocks.insert(1, [])
                 position_blocks.insert(1, [])
@@ -1419,17 +1432,38 @@ class PyExecutor:
 
         return result
 
+    def _merge_helix_requests(self, new_requests: list[RequestQueueItem]):
+
+        def make_fake_data(req_item: RequestQueueItem):
+            # similar to _merge_star_attention_requests, we need fake data for scheduler
+            # we simply partition by cp_size
+            input_tokens = req_item.request.input_token_ids
+            tokens_per_rank = (len(input_tokens) + self.dist.cp_size -
+                               1) // self.dist.cp_size
+            tokens_this_rank_start = tokens_per_rank * self.dist.cp_rank
+            tokens_this_rank_end = min(tokens_this_rank_start + tokens_per_rank,
+                                       len(input_tokens))
+            return req_item.id, req_item.request, [0] * (tokens_this_rank_end -
+                                                         tokens_this_rank_start)
+
+        return [
+            executor_request_to_llm_request(*make_fake_data(req_item))
+            for req_item in new_requests
+        ]
+
     @nvtx_range("_merge_requests")
     def _merge_requests(self, new_requests: list[RequestQueueItem]):
         cp_config = self.dist.cp_config
         if 'cp_type' in cp_config:
             cp_type = cp_config['cp_type']
-            if cp_type == 'star_attention':
+            if cp_type == CpType.STAR or cp_type == CpType.HELIX:
                 return self._merge_star_attention_requests(new_requests)
-            elif cp_type == 'ring_attention':
-                raise NotImplementedError("ring attention not implemented yet")
+            elif cp_type == CpType.HELIX:
+                return self._merge_helix_requests(new_requests)
+            elif cp_type == CpType.RING:
+                raise NotImplementedError("Ring attention not implemented yet")
             else:
-                raise NotImplementedError(f'unsupport cp type {cp_type}')
+                raise NotImplementedError(f"Unsupported cp type {cp_type.name}")
         else:
             return [
                 executor_request_to_llm_request(req_item.id, req_item.request)
@@ -1633,12 +1667,13 @@ class PyExecutor:
     @nvtx_range("_update_request_states")
     def _update_request_states(self, scheduled_requests: ScheduledRequests):
         cp_config = self.dist.cp_config
-        if 'cp_type' in cp_config:
+        # note: helix parallelism uses the same logic as tp parallelism here
+        if 'cp_type' in cp_config and cp_config['cp_type'] != CpType.HELIX:
             cp_type = cp_config['cp_type']
-            if cp_type == 'star_attention':
+            if cp_type == CpType.STAR:
                 self._update_request_states_star_attention(scheduled_requests)
             else:
-                assert False, f'Unsupport cp_type {cp_type}'
+                assert False, f"Unsupported cp_type {cp_type.name}"
         else:
             self._update_request_states_tp(scheduled_requests)
 

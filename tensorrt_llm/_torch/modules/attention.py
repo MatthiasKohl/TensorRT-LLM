@@ -6,14 +6,15 @@ from typing import Optional, Union, cast
 import torch
 from torch import nn
 
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.mapping import CpType, Mapping
 
 from ..attention_backend import (AttentionInputType, AttentionMetadata,
                                  TrtllmAttention, TrtllmAttentionMetadata)
-from ..attention_backend.interface import (PositionalEmbeddingParams,
+from ..attention_backend.interface import (AttentionBackend,
+                                           PositionalEmbeddingParams,
                                            PredefinedAttentionMask)
 from ..attention_backend.utils import create_attention, get_attention_backend
-from ..distributed import AllReduceParams
+from ..distributed import AllReduceParams, cp_allgather
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
 from ..utils import Fp4QuantizedTensor, get_model_extra_attrs
@@ -111,9 +112,11 @@ class Attention(nn.Module):
             tp_size = 1
 
         mapping = Mapping(
-            world_size=tp_size * pp_size,
+            world_size=tp_size * pp_size * config.mapping.cp_size,
             tp_size=tp_size,
             pp_size=pp_size,
+            cp_size=config.mapping.cp_size,
+            cp_config=config.mapping.cp_config,
             rank=config.mapping.rank,
             gpus_per_node=config.mapping.gpus_per_node,
             enable_attention_dp=config.mapping.enable_attention_dp,
@@ -445,18 +448,24 @@ class MLA(nn.Module):
 
         # tensor parallel
         config = config or ModelConfig()
-        tp_size = config.mapping.tp_size
-        pp_size = config.mapping.pp_size
-        if config.mapping.enable_attention_dp:
+        self.mapping = config.mapping
+        tp_size = self.mapping.tp_size
+        pp_size = self.mapping.pp_size
+        cp_size = self.mapping.cp_size
+        if self.mapping.enable_attention_dp:
             tp_size = 1
+        if self.mapping.has_cp_ulysses():
+            raise NotImplementedError("MLA doesn't support CP Ulyssees yet")
 
         mapping = Mapping(
-            world_size=tp_size * pp_size,
+            world_size=tp_size * pp_size * cp_size,
             tp_size=tp_size,
             pp_size=pp_size,
-            rank=config.mapping.rank,
-            gpus_per_node=config.mapping.gpus_per_node,
-            enable_attention_dp=config.mapping.enable_attention_dp,
+            cp_size=cp_size,
+            rank=self.mapping.rank,
+            gpus_per_node=self.mapping.gpus_per_node,
+            enable_attention_dp=self.mapping.enable_attention_dp,
+            cp_config=self.mapping.cp_config,
         )
 
         assert self.num_heads % tp_size == 0
@@ -676,6 +685,47 @@ class MLA(nn.Module):
                                                    self.qk_rope_head_dim)
         return k_pe
 
+    def _attn_forward(self, attn_instance: AttentionBackend, q: torch.Tensor,
+                      k: torch.Tensor, v: torch.Tensor,
+                      attn_metadata: AttentionMetadata, **kwargs):
+        if self.mapping.cp_size > 1 and self.mapping.cp_config.get(
+                "cp_type") == CpType.HELIX:
+            # partial_o: [num_tokens, num_heads * v_head_dim]
+            # softmax_stats: [num_tokens, num_heads, 2]
+            partial_o, softmax_stats = attn_instance.forward(
+                q, k, v, attn_metadata, compute_attention_stats=True, **kwargs)
+            # this is the post-processing of helix parallel attention,
+            # similar to the post-processing of ring attention
+            v_head_dim = partial_o.shape[-1] // softmax_stats.shape[1]
+            all_gathered = cp_allgather([partial_o, softmax_stats],
+                                        self.mapping,
+                                        dim=0)
+            # [num_tokens, num_heads * v_head_dim] -> [cp_size, num_tokens, num_heads * v_head_dim]
+            gathered_o = all_gathered[0].view(self.mapping.cp_size,
+                                              *partial_o.shape)
+            # [num_tokens, num_heads, 2] -> [cp_size, num_tokens, num_heads, 2]
+            gathered_stats = all_gathered[1].view(self.mapping.cp_size,
+                                                  *softmax_stats.shape)
+            # [cp_size, num_tokens, num_heads] -> [1, num_tokens, num_heads]
+            global_max = torch.max(gathered_stats[..., 0], dim=0,
+                                   keepdim=True)[0]
+            # [cp_size, num_tokens, num_heads]
+            corrected_max = gathered_stats[..., 0] - global_max
+            corrected_max_exp = torch.exp(corrected_max)
+            corrected_sum = gathered_stats[..., 1] * corrected_max_exp
+            # [cp_size, num_tokens, num_heads] -> [1, num_tokens, num_heads]
+            global_sum = torch.sum(corrected_sum, dim=0, keepdim=True)
+            # [cp_size, num_tokens, num_heads] -> [cp_size, num_tokens, num_heads, 1]
+            correction = torch.unsqueeze(corrected_max_exp / global_sum, -1)
+            # [cp_size, num_tokens, num_heads, v_head_dim]
+            corrected_o = gathered_o.view(*correction.shape[:-1],
+                                          v_head_dim) * correction
+            # [cp_size, num_tokens, num_heads, v_head_dim] -> [num_tokens, num_heads * v_head_dim]
+            attn_output = torch.sum(corrected_o.view(*gathered_o.shape), dim=0)
+            return attn_output.to(dtype=gathered_o.dtype)
+        else:
+            return attn_instance.forward(q, k, v, attn_metadata, **kwargs)
+
     def forward_impl_fake(self, hidden_states: torch.Tensor):
         num_tokens = hidden_states.shape[0]
         hidden_size = self.o_proj.in_features
@@ -756,6 +806,7 @@ class MLA(nn.Module):
             compressed_kv_gen = compressed_kv[num_ctx_tokens:, ...]
             k_pe_gen = k_pe[num_ctx_tokens:, ...]
             latent_cache_gen = latent_cache[num_ctx_tokens:, ...]
+
             if self.apply_rotary_emb:
                 assert position_ids is not None
                 k_pe_gen = self.apply_rope(q_gen, k_pe_gen, position_ids)
@@ -825,17 +876,15 @@ class MLA(nn.Module):
         # May concat q(including q_pe), k + k_pe, v together
         q, k, v = self._maybe_concat_qkv(q, k, v)
 
-        # out_scale = getattr(self.o_proj, "inv_input_scale", None)
-        out_scale = None  # Currently we use BF16 MHA for context phase
-
-        attn_output = self.mha.forward(
+        attn_output = self._attn_forward(
+            self.mha,
             q,
             k,
             v,
             attn_metadata,
             attention_input_type=AttentionInputType.context_only,
             latent_cache=latent_cache,
-            out_scale=out_scale,
+            out_scale=None,  # Currently we use BF16 MHA for context phase
         )
 
         return attn_output
@@ -929,17 +978,15 @@ class MLA(nn.Module):
             attn_metadata,
         )
 
-        # out_scale = getattr(self.o_proj, "inv_input_scale", None)
-        out_scale = None  # Currently we use BF16 MHA for context phase
-
-        attn_output = self.mha.forward(
+        attn_output = self._attn_forward(
+            self.mha,
             q,
             None,
             None,
             attn_metadata,
             attention_input_type=AttentionInputType.context_only,
             latent_cache=None,
-            out_scale=out_scale,
+            out_scale=None,  # Currently we use BF16 MHA for context phase
             mla_context_paged_kv=paged_full_kv,
             mla_context_kv_cache_block_offsets=
             mla_context_kv_cache_block_offsets,
@@ -1022,9 +1069,11 @@ class MLA(nn.Module):
         ])
 
         # out_scale = getattr(self.o_proj, "inv_input_scale", None)
-        out_scale = None  # Although we use FP8 MLA for generation phase, the output is still in BF16
+        # Although we use FP8 MLA for generation phase, the output is still in BF16
+        out_scale = None
 
-        attn_out_latent = self.mqa.forward(
+        attn_out_latent = self._attn_forward(
+            self.mqa,
             fused_q,
             None,
             None,
@@ -1034,6 +1083,7 @@ class MLA(nn.Module):
             latent_cache=latent_cache,  # kvcache and k_pe
             q_pe=q_pe,  # used by `invokeMLARopeGeneration`
         )
+
         fused_q = None
 
         assert (attn_out_latent.shape[0] == q.shape[0] and

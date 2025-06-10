@@ -429,6 +429,7 @@ def attention(
     mla_context_paged_kv: Optional[torch.Tensor],
     mla_context_kv_cache_block_offsets: Optional[torch.Tensor],
     attention_chunk_size: Optional[int],
+    compute_attention_stats: bool,
 ) -> List[torch.Tensor]:
     num_tokens = q.size(0)
     attention_input_type = (AttentionInputType(attention_input_type)
@@ -456,6 +457,13 @@ def attention(
         # NOTE(tizheng): Does this introduce overhead?
         output_sf = torch.empty(())  # Create a placeholder, which is not used.
 
+    if compute_attention_stats:
+        output_stats = q.new_empty((num_tokens, num_heads, 2),
+                                   dtype=torch.float32)
+    else:
+        output_stats = torch.empty(
+            ())  # Create a placeholder, which is not used.
+
     torch.ops.trtllm.attention_inplace(
         q, k, v, output_act, output_sf, out_dtype, workspace, sequence_length,
         host_past_key_value_lengths, context_lengths, host_context_lengths,
@@ -475,8 +483,8 @@ def attention(
         q_lora_rank, kv_lora_rank, qk_nope_head_dim, qk_rope_head_dim,
         v_head_dim, mrope_rotary_cos_sin, mrope_position_deltas,
         mla_context_paged_kv, mla_context_kv_cache_block_offsets,
-        attention_chunk_size)
-    return output_act, output_sf
+        attention_chunk_size, output_stats)
+    return [output_act, output_sf, output_stats]
 
 
 @attention.register_fake
@@ -542,6 +550,7 @@ def _(
     mla_context_paged_kv: Optional[torch.Tensor],
     mla_context_kv_cache_block_offsets: Optional[torch.Tensor],
     attention_chunk_size: Optional[int],
+    compute_attention_stats: bool,
 ) -> List[torch.Tensor]:
     num_tokens = q.size(0)
     attention_input_type = (AttentionInputType(attention_input_type)
@@ -568,4 +577,11 @@ def _(
                                  dtype=out_dtype)
         output_sf = torch.empty(())  # Create a placeholder, which is not used.
 
-    return output_act, output_sf
+    if compute_attention_stats:
+        output_stats = q.new_empty((num_tokens, num_heads, 2),
+                                   dtype=torch.float32)
+    else:
+        output_stats = torch.empty(
+            ())  # Create a placeholder, which is not used.
+
+    return [output_act, output_sf, output_stats]

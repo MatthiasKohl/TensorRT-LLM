@@ -443,6 +443,13 @@ class TorchStarAttentionSampler(TorchSampler):
             self.update_one_request(request, new_tokens_list, logits)
 
 
+class TorchHelixSampler(TorchSampler):
+
+    def update_requests(self, state: SampleState):
+        #TODO
+        pass
+
+
 class Algorithms:
 
     def defined_algorithms(self):

@@ -15,7 +15,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_manager import (LoraConfig,
                                        get_default_trtllm_modules_to_hf_modules,
                                        load_torch_hf_lora)
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.mapping import CpType, Mapping
 
 from ..model_config import ModelConfig
 from ..speculative import get_spec_decoder
@@ -25,8 +25,8 @@ from .model_engine import KV_CACHE_MANAGER_KEY, PyTorchModelEngine
 from .py_executor import PyExecutor
 from .resource_manager import (KVCacheManager, MambaHybridCacheManager,
                                PeftCacheManager, ResourceManager)
-from .sampler import (EarlyStopSampler, TorchSampler, TorchStarAttentionSampler,
-                      TRTLLMSampler)
+from .sampler import (EarlyStopSampler, TorchHelixSampler, TorchSampler,
+                      TorchStarAttentionSampler, TRTLLMSampler)
 from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
                         SimpleScheduler)
 from .seq_slot_manager import SeqSlotManager
@@ -454,10 +454,13 @@ def instantiate_sampler(model_engine: PyTorchModelEngine,
                         executor_config: ExecutorConfig,
                         pytorch_backend_config: PyTorchConfig,
                         mapping: Mapping):
-    if mapping.cp_config.get('cp_type') == 'star_attention':
+    if mapping.cp_config.get('cp_type') == CpType.STAR:
         assert pytorch_backend_config.attn_backend == "FLASHINFER_STAR_ATTENTION", "attention backend of star attention should be 'FLASHINFER_STAR_ATTENTION'"
         sampler = TorchStarAttentionSampler(
             max_seq_len=model_engine.max_seq_len)
+    # TODO
+    elif mapping.cp_config.get('cp_type') == CpType.HELIX:
+        sampler = TorchHelixSampler(max_seq_len=model_engine.max_seq_len)
     elif model_engine.spec_config is not None and model_engine.spec_config.spec_dec_mode.has_spec_decoder(
     ):
         sampler = get_spec_decoder(max_seq_len=model_engine.max_seq_len,

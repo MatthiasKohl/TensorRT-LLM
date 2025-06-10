@@ -1123,8 +1123,8 @@ class MTPEagleWorker(MTPWorker):
             if hasattr(attn_metadata, 'kv_lens_cuda'):
                 attn_metadata.kv_lens_cuda[:batch_size] += 1
             # support attention dp
-            if spec_metadata.all_rank_num_tokens is not None:
-                spec_metadata.all_rank_num_tokens = spec_metadata.all_rank_num_seqs
+            if spec_metadata.all_tp_rank_num_tokens is not None:
+                spec_metadata.all_tp_rank_num_tokens = spec_metadata.all_tp_rank_num_seqs
             inputs = {
                 "input_ids": new_draft_token,
                 "position_ids": position_ids,

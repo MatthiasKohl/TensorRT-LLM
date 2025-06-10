@@ -98,10 +98,13 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
     world_config = {
         "pp_size": params.get("pp"),
         "tp_size": params.get("tp"),
-        "world_size": params.get("pp") * params.get("tp"),
+        "cp_size": params.get("cp"),
+        "world_size": params.get("pp") * params.get("tp") * params.get("cp"),
         "ep_size": params.get("ep"),
         "cluster_size": params.get("cluster_size"),
     }
+    if params.get("cp_type", None) is not None:
+        world_config["cp_type"] = params["cp_type"]
 
     if params.get("max_batch_size") and params.get("max_num_tokens"):
         logger.info("Use user-provided max batch size and max num tokens.")

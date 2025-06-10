@@ -314,7 +314,12 @@ class StarAttention(AttentionBackend[StarAttentionMetadata]):
                 metadata: StarAttentionMetadata,
                 *,
                 attention_mask: AttentionMask = PredefinedAttentionMask.CAUSAL,
+                compute_attention_stats: bool = False,
                 **kwargs) -> torch.Tensor:
+        if compute_attention_stats:
+            raise NotImplementedError(
+                "StarAttention does not support compute_attention_stats yet.")
+
         assert isinstance(
             metadata,
             StarAttentionMetadata,
