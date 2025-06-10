@@ -23,7 +23,7 @@ from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import (PositionalEmbeddingParams,
                                            PredefinedAttentionMask, RopeParams)
 from ..model_config import ModelConfig
-from ..modules.attention import Attention, QkNormType
+from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_moe import (Llama4RenormalizeMoeRoutingMethod,
@@ -60,6 +60,7 @@ class Llama4Attention(Attention):
             rope=RopeParams.from_config(config),
             is_neox=False,
         ) if self.use_rope else None
+        self.use_qk_norm = use_qk_norm
 
         if model_config.attn_backend != "TRTLLM":
             # TODO: support chunked attention for other backends.
@@ -74,15 +75,15 @@ class Llama4Attention(Attention):
             max_position_embeddings=config.max_position_embeddings,
             bias=config.attention_bias,
             pos_embd_params=pos_embd_params,
-            qk_norm_type=QkNormType.post_rope
-            if use_qk_norm else QkNormType.none,
+            rope_fusion=not self.
+            use_qk_norm,  # Llama4 uses qk_norm after RoPE, so it is not possible to fuse RoPE into the attention OP with qk_norm.
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
             config=model_config,
             attention_chunk_size=attention_chunk_size,
         )
 
-        if self.use_rope and use_qk_norm:
+        if self.use_qk_norm:
             self.head_dim = config.hidden_size // config.num_attention_heads
             self.qk_norm = RMSNorm(hidden_size=self.head_dim,
                                    eps=1e-6,
@@ -115,6 +116,17 @@ class Llama4Attention(Attention):
 
         return q, k
 
+    def apply_rope(self, q: torch.Tensor, k: Optional[torch.Tensor],
+                   v: Optional[torch.Tensor], position_ids: torch.Tensor):
+        q, k, v = self.split_qkv(q, k, v)
+        if position_ids is not None:
+            q, k, v = super().apply_rope(q, k, v, position_ids)
+        # Llama4 applies QK norm after RoPE.
+        if self.use_qk_norm:
+            q, k = self.apply_qk_norm(q, k)
+
+        return q, k, v
+
     def _attention_scaling(self, q, position_ids):
 
         def _get_attn_scale(position_ids: torch.Tensor) -> torch.Tensor:
@@ -129,7 +141,7 @@ class Llama4Attention(Attention):
 
     def _forward_nope(
         self,
-        position_ids: Optional[torch.LongTensor],
+        position_ids: Optional[torch.IntTensor],
         hidden_states: Union[torch.Tensor, Fp4QuantizedTensor],
         attn_metadata: AttentionMetadata,
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.
@@ -166,7 +178,7 @@ class Llama4Attention(Attention):
 
     def forward(
         self,
-        position_ids: Optional[torch.LongTensor],
+        position_ids: Optional[torch.IntTensor],
         hidden_states: Union[torch.Tensor, Fp4QuantizedTensor],
         attn_metadata: AttentionMetadata,
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.
@@ -289,7 +301,7 @@ class Llama4MoE(nn.Module):
         routed_output = self.experts(
             hidden_states,
             router_logits,
-            cutlass_min_latency_mode,
+            cutlass_min_latency_mode=cutlass_min_latency_mode,
             all_tp_rank_num_tokens=all_tp_rank_num_tokens,
             use_dp_padding=use_dp_padding)
         return routed_output
@@ -409,7 +421,7 @@ class Llama4DecoderLayer(DecoderLayer):
 
     def forward(
         self,
-        position_ids: torch.LongTensor,
+        position_ids: torch.IntTensor,
         hidden_states: Union[torch.Tensor, Fp4QuantizedTensor],
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
@@ -547,7 +559,7 @@ class LlamaDecoderLayer(DecoderLayer):
 
     def forward(
         self,
-        position_ids: torch.LongTensor,
+        position_ids: torch.IntTensor,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
@@ -657,7 +669,7 @@ class Eagle3LlamaDecoderLayer(DecoderLayer):
 
     def forward(
         self,
-        position_ids: torch.LongTensor,
+        position_ids: torch.IntTensor,
         embeds: torch.Tensor,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
@@ -718,7 +730,7 @@ class Llama4Model(DecoderModel):
 
         # If enable_min_latency is True, we will use min-latency mode.
         DecoderLayerClass = Llama4DecoderLayer
-        if model_config.pytorch_backend_config.enable_min_latency:
+        if model_config.enable_min_latency:
             from .modeling_llama_min_latency import Llama4MinLatencyDecoderLayer
             DecoderLayerClass = Llama4MinLatencyDecoderLayer
 
@@ -736,8 +748,8 @@ class Llama4Model(DecoderModel):
     def forward(
         self,
         attn_metadata: AttentionMetadata,
-        input_ids: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
+        input_ids: Optional[torch.IntTensor] = None,
+        position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         spec_metadata: Optional[SpecMetadata] = None,
         lora_params=None,
@@ -826,8 +838,8 @@ class LlamaModel(DecoderModel):
     def forward(
         self,
         attn_metadata: AttentionMetadata,
-        input_ids: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
+        input_ids: Optional[torch.IntTensor] = None,
+        position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         spec_metadata: Optional[SpecMetadata] = None,
         lora_params=None,
@@ -880,12 +892,14 @@ class LlamaForCausalLM(DecoderModelForCausalLM[LlamaModel, LlamaConfig]):
                 trust_remote_code=True,
                 attn_backend=model_config.attn_backend,
                 moe_backend=model_config.moe_backend,
-                mapping=model_config.mapping)
-            draft_config.spec_config = model_config.spec_config
-            draft_config.max_num_tokens = model_config.max_num_tokens
-            draft_config.moe_max_num_tokens = model_config.moe_max_num_tokens
+                mapping=model_config.mapping,
+                spec_config=model_config.spec_config,
+                max_num_tokens=model_config.max_num_tokens,
+                moe_max_num_tokens=model_config.moe_max_num_tokens)
+
             draft_config.quant_config.kv_cache_quant_algo = \
                 model_config.quant_config.kv_cache_quant_algo
+
             self.draft_model = Eagle3LlamaForCausalLM(
                 draft_config, model_config.pretrained_config.num_hidden_layers)
             self.spec_worker = get_spec_worker(model_config.spec_config,
@@ -937,15 +951,6 @@ class LlamaForCausalLM(DecoderModelForCausalLM[LlamaModel, LlamaConfig]):
 
         return logits
 
-    def infer_max_seq_len(self):
-        if self.model_config.attn_backend.upper() != 'TRTLLM':
-            logger.warning(
-                f"Attention backend {self.model_config.attn_backend} "
-                "does not support chunked attention. Sequence length "
-                "will be limited to 8192.")
-            return 8192
-        return super().infer_max_seq_len()
-
     def load_weights(self, weights: Dict):
         super().load_weights(weights, skip_modules=["draft_model"])
 
@@ -956,9 +961,16 @@ class LlamaForCausalLM(DecoderModelForCausalLM[LlamaModel, LlamaConfig]):
 
 class Llama4InputProcessor(InputProcessor):
 
-    def __init__(self, model_path, model_config, tokenizer):
-        self.processor = AutoProcessor.from_pretrained(model_path,
-                                                       use_fast=True)
+    def __init__(self,
+                 model_path,
+                 model_config,
+                 tokenizer,
+                 trust_remote_code: bool = True):
+        self.use_fast = True
+        self.processor = AutoProcessor.from_pretrained(
+            model_path,
+            trust_remote_code=trust_remote_code,
+            use_fast=self.use_fast)
         self.model_config = model_config
         self.tokenizer = tokenizer
         self.vocab_size = model_config.text_config.vocab_size
@@ -1015,7 +1027,7 @@ class Llama4InputProcessor(InputProcessor):
 
 
 @register_auto_model("Llama4ForConditionalGeneration")
-@register_input_processor(Llama4InputProcessor)
+@register_input_processor(Llama4InputProcessor, model_type="llama4")
 class Llama4ForConditionalGeneration(DecoderModelForCausalLM[Llama4Model,
                                                              Llama4Config]):
 
@@ -1058,8 +1070,8 @@ class Llama4ForConditionalGeneration(DecoderModelForCausalLM[Llama4Model,
     def forward(
         self,
         attn_metadata: AttentionMetadata,
-        input_ids: torch.LongTensor = None,
-        position_ids: Optional[torch.LongTensor] = None,
+        input_ids: torch.IntTensor = None,
+        position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         return_context_logits: bool = False,
         spec_metadata: Optional[SpecMetadata] = None,
@@ -1113,8 +1125,14 @@ class Llama4ForConditionalGeneration(DecoderModelForCausalLM[Llama4Model,
             return logits
 
     def infer_max_seq_len(self):
-        # TODO: implement chunked attention to support 10M context length
-        return 8192
+        if self.model_config.attn_backend.upper() != 'TRTLLM':
+            logger.warning(
+                f"Attention backend {self.model_config.attn_backend} "
+                "does not support chunked attention. Sequence length "
+                "will be limited to 8192.")
+            return 8192
+
+        return super().infer_max_seq_len()
 
     def load_weights(self, weights: Dict):
         new_weights = {}
@@ -1212,8 +1230,8 @@ class Eagle3LlamaDraftModel(DecoderModel):
     def forward(
         self,
         attn_metadata: AttentionMetadata,
-        input_ids: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
+        input_ids: Optional[torch.IntTensor] = None,
+        position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         spec_metadata: Optional[SpecMetadata] = None,
         hidden_states: Optional[torch.Tensor] = None,
@@ -1242,8 +1260,6 @@ class Eagle3LlamaDraftModel(DecoderModel):
 
         hidden_states, hidden_states_to_save = self.norm(
             hidden_states, residual)
-        if self.spec_config.spec_dec_mode.is_eagle3():
-            spec_metadata.maybe_capture_hidden_states(1, hidden_states_to_save)
         return hidden_states, hidden_states_to_save
 
 
@@ -1265,8 +1281,8 @@ class Eagle3LlamaForCausalLM(DecoderModelForCausalLM[Eagle3LlamaDraftModel,
     def forward(
         self,
         attn_metadata: AttentionMetadata,
-        input_ids: torch.LongTensor = None,
-        position_ids: Optional[torch.LongTensor] = None,
+        input_ids: torch.IntTensor = None,
+        position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         return_context_logits: bool = False,
         spec_metadata: Optional[SpecMetadata] = None,
