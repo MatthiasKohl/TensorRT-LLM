@@ -1194,20 +1194,15 @@ class PyTorchModelEngine(ModelEngine):
                 # Process only this rank's portion of tokens
                 rank_prompt_tokens = prompt_tokens[
                     tokens_this_rank_start:tokens_this_rank_end]
-                rank_begin_compute = begin_compute + tokens_this_rank_start
-                rank_position_start = rank_begin_compute
             else:
                 # Regular TP case: process all tokens
                 rank_prompt_tokens = prompt_tokens
-                rank_begin_compute = begin_compute
-                rank_position_start = begin_compute
 
             request_ids.append(request.py_request_id)
             draft_lens.append(0)
 
             position_ids.extend(
-                range(rank_position_start,
-                      rank_position_start + len(rank_prompt_tokens)))
+                range(begin_compute, begin_compute + len(rank_prompt_tokens)))
             input_ids.extend(rank_prompt_tokens)
             gather_ids.append(len(input_ids) - 1)
             sequence_lengths.append(len(rank_prompt_tokens))
@@ -1587,18 +1582,14 @@ class PyTorchModelEngine(ModelEngine):
                 # Process only this rank's portion of tokens
                 rank_prompt_tokens = prompt_tokens[
                     tokens_this_rank_start:tokens_this_rank_end]
-                rank_position_start = tokens_this_rank_start
             else:
                 # Regular TP case: process all tokens
                 rank_prompt_tokens = prompt_tokens
-                rank_position_start = 0
 
             input_ids.extend(rank_prompt_tokens)
             request_ids.append(request.py_request_id)
             if request.position_ids is None:
-                position_ids.extend(
-                    range(rank_position_start,
-                          rank_position_start + len(rank_prompt_tokens)))
+                position_ids.extend(range(len(rank_prompt_tokens)))
             else:
                 # For helix parallelism, need to adjust provided position_ids
                 if self.has_cp_helix:
