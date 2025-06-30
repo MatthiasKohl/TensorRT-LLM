@@ -59,6 +59,7 @@ from .config_utils import is_mla
 from .cuda_graph_runner import DecodingCUDAGraphRunner
 from .guided_decoder import GuidedDecoder
 from .layerwise_nvtx_marker import LayerwiseNvtxMarker
+from .llm_request import LlmRequest
 from .resource_manager import (BaseResourceManager, KVCacheManager,
                                ResourceManager, ResourceManagerType)
 from .scheduler import ScheduledRequests
@@ -339,7 +340,6 @@ class PyTorchModelEngine(ModelEngine):
         self.batch_size = batch_size
         self.max_num_tokens = max_num_tokens
         self.max_seq_len = max_seq_len
-        self.has_cp_helix = mapping.has_cp_helix()
 
         self.mapping = mapping
         if mapping.has_pp():
@@ -672,6 +672,8 @@ class PyTorchModelEngine(ModelEngine):
                             spec_resource_manager.free_resources(req)
 
         # TODO: current warmup_request is not suitable for context parallelism
+        # TODO: check whether this is actually the case for Helix parallelism:
+        # mainly, the dummy requests need to be split across KVP ranks for Helix
         cp_type = self.mapping.cp_config.get('cp_type', None)
         if cp_type is not None:
             return
@@ -1130,6 +1132,15 @@ class PyTorchModelEngine(ModelEngine):
                         self.previous_kv_lens_offsets_cuda[:num_gen_requests])
         return inputs
 
+    def _get_helix_prompt_length(self, request: LlmRequest):
+        # we split the request across KVP ranks for Helix parallelism
+        kvp_rank = self.mapping.cp_rank
+        len_per_rank = (request.py_prompt_len + self.mapping.cp_size -
+                        1) // self.mapping.cp_size
+        len_this_rank = len_per_rank if kvp_rank != self.mapping.cp_size - 1 else request.py_prompt_len - len_per_rank * (
+            self.mapping.cp_size - 1)
+        return len_this_rank
+
     def _prepare_tp_inputs(
             self,
             scheduled_requests: ScheduledRequests,
@@ -1253,6 +1264,9 @@ class PyTorchModelEngine(ModelEngine):
                     # We're treating the prompt lengths as context requests here, so
                     # the the prompt lens should not include the cached tokens.
                     prompt_lengths.append(1 + num_draft_tokens)
+                elif self.mapping.has_cp_helix():
+                    prompt_lengths.append(
+                        self._get_helix_prompt_length(request))
                 else:
                     prompt_lengths.append(request.py_prompt_len)
 
@@ -1295,7 +1309,11 @@ class PyTorchModelEngine(ModelEngine):
                                             (1 + self.max_draft_len))
                 num_cached_tokens_per_seq.append(past_seen_token_num +
                                                  self.max_draft_len + 1)
-                prompt_lengths.append(request.py_prompt_len)
+                if self.mapping.has_cp_helix():
+                    prompt_lengths.append(
+                        self._get_helix_prompt_length(request))
+                else:
+                    prompt_lengths.append(request.py_prompt_len)
                 request_ids.append(request.py_request_id)
 
         sequence_lengths.extend([1] * len(generation_requests))
@@ -1308,8 +1326,6 @@ class PyTorchModelEngine(ModelEngine):
             # (1) new_tokens_device is None, which means overlap scheduler is disabled; or
             # (2) a dummy request; or
             # (3) the first step in the generation server of disaggregated serving
-            # TODO split this request s.t. KV cache is split between KVP GPUs for Helix parallelism
-            # we assume disaggreated for this: (3) above
             if new_tokens_device is None or request.is_dummy or request.py_batch_idx is None:
                 # skip adding input_ids of CUDA graph dummy requests so that new_tokens_device
                 # can be aligned to the correct positions.
@@ -1324,7 +1340,10 @@ class PyTorchModelEngine(ModelEngine):
             request_ids.append(request.py_request_id)
             position_ids.append(past_seen_token_num)
             num_cached_tokens_per_seq.append(past_seen_token_num)
-            prompt_lengths.append(request.py_prompt_len)
+            if self.mapping.has_cp_helix():
+                prompt_lengths.append(self._get_helix_prompt_length(request))
+            else:
+                prompt_lengths.append(request.py_prompt_len)
             draft_lens.append(0)
 
             request.py_batch_idx = batch_idx
@@ -1501,11 +1520,6 @@ class PyTorchModelEngine(ModelEngine):
                     attn_metadata.num_tokens)
                 attn_metadata.all_tp_rank_num_tokens = all_tp_rank_num_tokens
 
-        if self.has_cp_helix:
-            all_cp_rank_num_tokens = self.dist.cp_allgather(
-                attn_metadata.num_tokens)
-            attn_metadata.all_cp_rank_num_tokens = all_cp_rank_num_tokens
-
         num_generation_tokens = len(generation_requests) + len(
             extend_requests) + sum(draft_lens)
         self.iter_states['num_ctx_requests'] = num_ctx_requests
@@ -1639,11 +1653,6 @@ class PyTorchModelEngine(ModelEngine):
                 all_tp_rank_num_tokens = self.dist.tp_allgather(
                     attn_metadata.num_tokens)
                 attn_metadata.all_tp_rank_num_tokens = all_tp_rank_num_tokens
-
-        if self.has_cp_helix:
-            all_cp_rank_num_tokens = self.dist.cp_allgather(
-                attn_metadata.num_tokens)
-            attn_metadata.all_cp_rank_num_tokens = all_cp_rank_num_tokens
 
         return inputs, None
 
@@ -1866,11 +1875,6 @@ class PyTorchModelEngine(ModelEngine):
                 attn_metadata.num_tokens)
             attn_metadata.all_tp_rank_num_tokens = all_tp_rank_num_tokens
 
-        if self.has_cp_helix:
-            all_cp_rank_num_tokens = self.dist.cp_allgather(
-                attn_metadata.num_tokens)
-            attn_metadata.all_cp_rank_num_tokens = all_cp_rank_num_tokens
-
         return {
             'attn_metadata': attn_metadata,
             'input_ids': self.input_ids_cuda[:num_tokens],
@@ -2012,11 +2016,11 @@ class PyTorchModelEngine(ModelEngine):
         print(
             f"#scheduled generation requests: {len(scheduled_requests.generation_requests)}"
         )
-        for request in scheduled_requests.context_requests:
-            print(f"context request: {request}")
+        # for request in scheduled_requests.context_requests:
+        #     print(f"context request: {request}")
         for request in scheduled_requests.generation_requests:
             print(f"generation request: {request}")
-        if cp_type is None or self.has_cp_helix:
+        if cp_type is None or cp_type == CpType.HELIX:
             return self._prepare_tp_inputs(scheduled_requests, kv_cache_manager,
                                            attn_metadata, spec_metadata,
                                            new_tensors_device)

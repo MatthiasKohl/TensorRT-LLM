@@ -444,6 +444,29 @@ class Mapping(object):
             p = p - self.world_size
         return p
 
+    def is_last_cp_rank(self):
+        return self.cp_rank == self.cp_size - 1
+
+    def is_first_cp_rank(self):
+        return self.cp_rank == 0
+
+    def has_cp(self):
+        return self.cp_size > 1
+
+    def prev_cp_rank(self):
+        p = self.rank - self.tp_size
+        if p // (self.tp_size * self.cp_size) < self.rank // (self.tp_size *
+                                                              self.cp_size):
+            return p + self.tp_size * self.cp_size
+        return p
+
+    def next_cp_rank(self):
+        p = self.rank + self.tp_size
+        if p // (self.tp_size * self.cp_size) > self.rank // (self.tp_size *
+                                                              self.cp_size):
+            return p - self.tp_size * self.cp_size
+        return p
+
     def has_moe_cluster(self):
         return self.moe_cluster_size > 1
 

@@ -278,8 +278,8 @@ public:
         {
             TLLM_CHECK_WITH_INFO(softmax_stats_tensor.value().size(-1) == 2,
                 "softmax_stats_tensor must be a float tensor with last dimension 2");
-            common_enqueue_params.softmaxStatsPtr
-                = static_cast<float2*>(softmax_stats_tensor.value().data_ptr<float>());
+            common_enqueue_params.softmax_stats
+                = reinterpret_cast<float2*>(softmax_stats_tensor.value().data_ptr<float>());
         }
 
         if (is_context) // context stage

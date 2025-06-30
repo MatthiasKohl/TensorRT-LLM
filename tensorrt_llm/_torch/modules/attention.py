@@ -501,7 +501,7 @@ class MLA(nn.Module):
         self.num_key_value_heads = (self.num_key_value_heads + tp_size -
                                     1) // tp_size
 
-        rms_norm_eps = config.pretrained_config.rms_norm_eps
+        rms_norm_eps = getattr(config.pretrained_config, "rms_norm_eps", 1e-6)
         quant_config = config.get_quant_config()
         self.quant_config = quant_config
 
@@ -724,11 +724,21 @@ class MLA(nn.Module):
                 "cp_type") == CpType.HELIX:
             # partial_o: [num_tokens, num_heads * v_head_dim]
             # softmax_stats: [num_tokens, num_heads, 2]
-            partial_o, softmax_stats = attn_instance.forward(
-                q, k, v, attn_metadata, compute_attention_stats=True, **kwargs)
+            softmax_stats = torch.empty(q.shape[0],
+                                        self.num_heads,
+                                        2,
+                                        device=q.device,
+                                        dtype=torch.float32)
+            partial_o = attn_instance.forward(
+                q,
+                k,
+                v,
+                attn_metadata,
+                softmax_stats_tensor=softmax_stats,
+                **kwargs)
             # this is the post-processing of helix parallel attention,
             # similar to the post-processing of ring attention
-            v_head_dim = partial_o.shape[-1] // softmax_stats.shape[1]
+            v_head_dim = partial_o.shape[-1] // self.num_heads
             all_gathered = cp_allgather([partial_o, softmax_stats],
                                         self.mapping,
                                         dim=0)
