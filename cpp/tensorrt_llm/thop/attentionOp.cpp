@@ -82,7 +82,8 @@ public:
         std::vector<std::optional<torch::Tensor>> mla_tensor_params,
         torch::optional<torch::Tensor> softmax_stats_tensor,
         c10::ArrayRef<std::optional<torch::Tensor>> spec_decoding_tensor_params,
-        torch::optional<torch::Tensor> attention_sinks) const
+        torch::optional<torch::Tensor> attention_sinks,
+        torch::optional<torch::Tensor> helix_position_offsets) const
         = 0;
 };
 
@@ -137,7 +138,8 @@ public:
         std::vector<std::optional<torch::Tensor>> mla_tensor_params,
         torch::optional<torch::Tensor> softmax_stats_tensor,
         c10::ArrayRef<std::optional<torch::Tensor>> spec_decoding_tensor_params,
-        torch::optional<torch::Tensor> attention_sinks) const override
+        torch::optional<torch::Tensor> attention_sinks,
+        torch::optional<torch::Tensor> helix_position_offsets) const override
     {
         auto stream = at::cuda::getCurrentCUDAStream(qkv_or_q.get_device());
         T* attention_input = static_cast<T*>(qkv_or_q.slice(0, token_offset).data_ptr());
