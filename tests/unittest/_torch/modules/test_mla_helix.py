@@ -70,7 +70,32 @@ class Scenario:
     ref_steps: int = 4
 
 
-scenarios = [Scenario()]
+scenarios = [
+    Scenario(batch=1, seq_len=1024),
+    Scenario(batch=1, seq_len=2048),
+    Scenario(batch=1, seq_len=4096),
+    Scenario(batch=1, seq_len=8192),
+    Scenario(batch=1, seq_len=16384),
+    Scenario(batch=1, seq_len=32768),
+    Scenario(batch=1, seq_len=65536),
+    Scenario(batch=1, seq_len=131072),
+    Scenario(batch=8, seq_len=1024),
+    Scenario(batch=8, seq_len=2048),
+    Scenario(batch=8, seq_len=4096),
+    Scenario(batch=8, seq_len=8192),
+    Scenario(batch=8, seq_len=16384),
+    Scenario(batch=8, seq_len=32768),
+    Scenario(batch=8, seq_len=65536),
+    Scenario(batch=8, seq_len=131072),
+    Scenario(batch=16, seq_len=1024),
+    Scenario(batch=16, seq_len=2048),
+    Scenario(batch=16, seq_len=4096),
+    Scenario(batch=16, seq_len=8192),
+    Scenario(batch=16, seq_len=16384),
+    Scenario(batch=16, seq_len=32768),
+    Scenario(batch=16, seq_len=65536),
+    Scenario(batch=16, seq_len=131072),
+]
 
 
 # default values from deepseek_v3, but will be overwritten by scenario
@@ -189,24 +214,6 @@ def _run_mla_distributed(rank: int, world_size: int, scenario: Scenario,
     position_ids_ctx_bs = position_ids_ctx.view(scenario.batch,
                                                 scenario.seq_len)
     position_ids_gen = position_ids_ctx_bs[:, 0].contiguous()
-
-    # ref_q_all = ref_q.view(
-    #     scenario.batch, scenario.seq_len,
-    #     scenario.num_heads *
-    #     (scenario.qk_nope_head_dim + scenario.qk_rope_head_dim))
-    # q = ref_q_all[:, rank * seq_len_per_gpu:(rank + 1) * seq_len_per_gpu, :]
-    # q = q.view(
-    #     scenario.batch * seq_len_per_gpu,
-    #     scenario.num_heads *
-    #     (scenario.qk_nope_head_dim + scenario.qk_rope_head_dim)).contiguous()
-    # latent_cache_all = ref_latent_cache.view(
-    #     scenario.batch, scenario.seq_len,
-    #     scenario.kv_lora_rank + scenario.qk_rope_head_dim)
-    # latent_cache = latent_cache_all[:, rank * seq_len_per_gpu:(rank + 1) *
-    #                                 seq_len_per_gpu, :]
-    # latent_cache = latent_cache.view(
-    #     scenario.batch * seq_len_per_gpu,
-    #     scenario.kv_lora_rank + scenario.qk_rope_head_dim).contiguous()
 
     # split inputs into chunks for each rank
     input_ctx_bs_rank = input_ctx_bs[:, rank * seq_len_per_gpu:(rank + 1) *
@@ -409,17 +416,6 @@ def _run_single_rank(func, *args, **kwargs):
     torch.cuda.set_device(rank)
     print(f"rank {rank} starting")
     try:
-        # world_size = tensorrt_llm.mpi_world_size()
-        # os.environ['MASTER_ADDR'] = 'localhost'
-        # os.environ['MASTER_PORT'] = '12355'
-        # os.environ['LOCAL_RANK'] = str(rank)
-        # os.environ['WORLD_SIZE'] = str(world_size)
-        # os.environ['RANK'] = str(rank)
-        # torch.distributed.init_process_group(backend="nccl",
-        #                                      world_size=world_size,
-        #                                      rank=rank,
-        #                                      device_id=torch.device(
-        #                                          'cuda', rank))
         ret = func(rank, *args, **kwargs)
         print(f"rank {rank} done")
         return ret
@@ -427,8 +423,6 @@ def _run_single_rank(func, *args, **kwargs):
         traceback.print_exc()
         tb = traceback.format_exc()
         raise Exception(f"\n\nError occurred. Original traceback is\n{tb}\n")
-    # finally:
-    #     torch.distributed.destroy_process_group()
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2,
@@ -444,87 +438,7 @@ def test_mla_helix_distributed(scenario: Scenario):
             assert r is None
 
 
-@torch.inference_mode
-def column_linear_forward(x, hidden_size, dtype, tensor_parallel_size,
-                          tensor_parallel_rank, weights):
-    from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
-    x = x.cuda()
-    l0 = Linear(
-        in_features=hidden_size,
-        out_features=hidden_size,
-        bias=False,
-        dtype=dtype,
-        mapping=Mapping(
-            world_size=tensor_parallel_size,
-            tp_size=tensor_parallel_size,
-            rank=tensor_parallel_rank,
-        ),
-        tensor_parallel_mode=TensorParallelMode.COLUMN,
-        gather_output=True,
-    )
-    l0.load_weights([dict(weight=weights[0])])
-    l0.cuda()
-
-    l0 = torch.compile(l0, fullgraph=True)
-    output = l0.forward(x)
-
-    # torch run
-    import torch.nn as nn
-    l0 = nn.Linear(in_features=hidden_size,
-                   out_features=hidden_size,
-                   bias=False,
-                   dtype=dtype)
-    l0.weight.data.copy_(weights[0])
-    l0.cuda()
-
-    torch_output = l0.forward(x)
-
-    # compare
-    torch.cuda.synchronize()
-    torch.testing.assert_close(output, torch_output)
-
-
-def run_single_rank(tensor_parallel_size, single_rank_forward_func, input,
-                    weights, hidden_size, dtype):
-    rank = tensorrt_llm.mpi_rank()
-    torch.cuda.set_device(rank)
-    try:
-        single_rank_forward_func(input, hidden_size, dtype,
-                                 tensor_parallel_size, rank, weights)
-    except Exception:
-        traceback.print_exc()
-        raise
-    return True
-
-
-# @pytest.mark.skipif(torch.cuda.device_count() < 2,
-#                     reason='needs 2 GPUs to run this test')
-# @pytest.mark.parametrize("hidden_size", [128, 127],
-#                          ids=["balanced", "unbalanced"])
-# def test_column_linear(hidden_size):
-#     torch.manual_seed(42)
-#     seq_len = 10
-#     dtype = torch.bfloat16
-#     tensor_parallel_size = 2
-#     x = torch.randn((seq_len, hidden_size), dtype=dtype)
-#     l0_weight = torch.randn((hidden_size, hidden_size), dtype=dtype)
-#     with MPIPoolExecutor(max_workers=tensor_parallel_size) as executor:
-#         results = executor.map(
-#             run_single_rank,
-#             *zip(*[(tensor_parallel_size, column_linear_forward, x, [l0_weight],
-#                     hidden_size, dtype)] * 2))
-#         if hidden_size % 2 != 0:
-#             with pytest.raises(AssertionError):
-#                 for r in results:
-#                     assert r is True
-#         else:
-#             for r in results:
-#                 assert r is True
-@pytest.mark.skipif(torch.cuda.device_count() < 2,
-                    reason='needs 2 GPUs to run this test')
-def test_dummy():
-    assert True
-
-
 if __name__ == "__main__":
-    test_mla_helix_distributed(scenarios[0])
+    for scenario in scenarios:
+        print(f"Running scenario: {scenario}")
+        test_mla_helix_distributed(scenario)
