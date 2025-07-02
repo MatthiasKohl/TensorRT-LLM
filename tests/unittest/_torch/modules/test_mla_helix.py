@@ -70,7 +70,7 @@ class Scenario:
     ref_steps: int = 4
 
 
-scenarios = [
+all_scenarios = [
     Scenario(batch=1, seq_len=1024),
     Scenario(batch=1, seq_len=2048),
     Scenario(batch=1, seq_len=4096),
@@ -95,6 +95,16 @@ scenarios = [
     Scenario(batch=16, seq_len=32768),
     Scenario(batch=16, seq_len=65536),
     Scenario(batch=16, seq_len=131072),
+]
+
+# limit the number of test scenarios to avoid taking too long
+test_scenarios = [
+    all_scenarios[1],
+    all_scenarios[5],
+    all_scenarios[8],
+    all_scenarios[12],
+    all_scenarios[18],
+    all_scenarios[19],
 ]
 
 
@@ -259,9 +269,9 @@ def _run_mla_distributed(rank: int, world_size: int, scenario: Scenario,
     end = time.time()
     avg_gen_time = (end - start) / (scenario.gen_steps - scenario.ref_steps)
     throughput = scenario.batch / avg_gen_time
-    print(
-        f"{world_size}-GPU: time taken for {scenario.gen_steps - scenario.ref_steps} steps: {end - start} s, throughput: {throughput} MLA/s"
-    )
+    print(f"Rank {rank} {world_size}-GPU: time taken for "
+          f"{scenario.gen_steps - scenario.ref_steps} steps: "
+          f"{end - start} s, throughput: {throughput} MLA/s")
     output = torch.stack(outputs, dim=0)
     kv_cache_manager.shutdown()
 
@@ -378,8 +388,8 @@ def _full_test_multi_gpu(rank: int, world_size: int, scenario: Scenario):
         avg_gen_time = (end - start) / (scenario.gen_steps - scenario.ref_steps)
         throughput = scenario.batch / avg_gen_time
         print(
-            f"Time taken for {scenario.gen_steps - scenario.ref_steps} steps: {end - start} s, throughput: {throughput} MLA/s"
-        )
+            f"Time taken for {scenario.gen_steps - scenario.ref_steps} steps: "
+            f"{end - start} s, throughput: {throughput} MLA/s")
         ref_output = torch.stack(ref_outputs, dim=0)
         ref_kv_cache_manager.shutdown()
     else:
@@ -394,17 +404,11 @@ def _full_test_multi_gpu(rank: int, world_size: int, scenario: Scenario):
                       rank=rank,
                       cp_size=world_size,
                       cp_config={'cp_type': CpType.HELIX})
-    print(
-        f"rank {rank} mapping: {mapping.world_size} / {mapping.cp_size} calling cp_allgather"
-    )
     # we use cp_allgather here because there is no broadcast op across CP group
     from tensorrt_llm._torch.distributed.ops import cp_allgather
     ref_output_all = cp_allgather(ref_output, mapping=mapping, dim=0)
     # we only need the values from rank 0
     ref_output = ref_output_all.view(world_size, *ref_output.shape)[0]
-    print(
-        f"rank {rank} mapping: {mapping.world_size} / {mapping.cp_size} got ref_output {ref_output.dtype} / shape {ref_output.shape} from rank 0 through cp_allgather"
-    )
     test_params = (input_ctx, position_ids_ctx, weights, ref_q,
                    ref_latent_cache, pos_embd_params)
     _run_mla_distributed(rank, world_size, scenario, mapping, test_params,
@@ -427,7 +431,9 @@ def _run_single_rank(func, *args, **kwargs):
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2,
                     reason="needs 2 GPUs to run this test")
-@pytest.mark.parametrize("scenario", scenarios, ids=lambda x: f"scenario: {x}")
+@pytest.mark.parametrize("scenario",
+                         test_scenarios,
+                         ids=lambda x: f"scenario: {x}")
 def test_mla_helix_distributed(scenario: Scenario):
     world_size = 2
     with MPIPoolExecutor(max_workers=world_size) as executor:
@@ -439,6 +445,6 @@ def test_mla_helix_distributed(scenario: Scenario):
 
 
 if __name__ == "__main__":
-    for scenario in scenarios:
+    for scenario in all_scenarios:
         print(f"Running scenario: {scenario}")
         test_mla_helix_distributed(scenario)
