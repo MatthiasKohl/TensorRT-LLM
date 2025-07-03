@@ -50,7 +50,6 @@ class Scenario:
     qk_rope_head_dim: int = 64
     v_head_dim: int = 128
     hidden_size: int = 2560
-    max_position_embeddings: int = 4096
     rope_theta: float = 10000.0
     rope_scaling: bool = False
     rope_beta_fast: int = 32
@@ -68,6 +67,11 @@ class Scenario:
     seq_len: int = 1024
     gen_steps: int = 256
     ref_steps: int = 4
+
+    @property
+    def max_position_embeddings(self) -> int:
+        # ensure that max_position_embeddings is set large enough for every scenario
+        return self.seq_len + 1
 
 
 all_scenarios = [
