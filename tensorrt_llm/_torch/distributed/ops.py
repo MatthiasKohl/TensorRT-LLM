@@ -228,6 +228,81 @@ def allgather(
     return output
 
 
+def alltoall(
+    inputs: Union[torch.Tensor, List[torch.Tensor]],
+    group: List[int],
+    dim: Union[int, List[int]] = -1,
+    new_dim: Union[Optional[int], List[Optional[int]]] = None,
+) -> Union[torch.Tensor, List[torch.Tensor]]:
+    '''
+    Add an operation that performs a collective all-to-all across both TP and CP groups.
+
+    The operation is implemented using a torch op that wraps a NCCL group call of a series of
+    NCCL send/recv operations to implement the all-to-all. See the following materials for details.
+    https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/p2p.html#all-to-all,
+    https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/api/group.html.
+
+    Args:
+        inputs (Union[Tensor, List[Tensor]]): The input tensor or tensor list.
+        group (List[int]): The group of ranks to participate in the all-to-all.
+        dim (Union[int, List[int]]): Split along given dimension. By default -1.
+        new_dim (Union[Optional[int], List[Optional[int]]]): The dimension to stack the splits along.
+            If None (default), the splits are concatenated along dimension `dim`.
+    Returns:
+        The tensor when combining all splits from all participating ranks, or a list of tensors when `inputs` is a list of tensors.
+    '''
+    n_ranks = len(group)
+    if n_ranks == 1:
+        return inputs
+
+    assert n_ranks > 0, "group must be non-empty"
+    assert n_ranks == len(set(group)), "group must be unique"
+    is_single_tensor = isinstance(inputs, torch.Tensor)
+
+    if is_single_tensor:
+        assert isinstance(dim, int)
+        assert new_dim is None or isinstance(new_dim, int)
+        inputs = [inputs]
+        new_dim = [new_dim]
+        dim = [dim]
+    assert len(dim) == len(inputs)
+    assert all(isinstance(d, int) for d in dim)
+    assert len(new_dim) == len(inputs)
+    assert all(new_dim is None or isinstance(d, int) for d in new_dim)
+
+    op_inputs = []
+
+    for inp in inputs:
+        size_per_rank, rem = divmod(inp.shape[dim], n_ranks)
+        assert rem == 0, \
+            f"input.shape[{dim}] must be divisible by n_ranks ({n_ranks}), but got shape {inp.shape}"
+
+        # we split the input into n_ranks equal parts along dimension `dim`
+        # note: the requirement for the C++ op is that all parts have same shape,
+        # dtype and device. If we make sure that size at `dim` evenly divides into
+        # `n_ranks`, all the conditions are met
+        op_inputs.extend(torch.split(inp, size_per_rank, dim=dim))
+
+    outputs = torch.ops.trtllm.alltoall(
+        op_inputs,
+        group,
+        num_lists=len(inputs),
+    )
+
+    outputs_split = [
+        outputs[i * n_ranks:(i + 1) * n_ranks] for i in range(len(inputs))
+    ]
+    for i in range(len(inputs)):
+        if new_dim[i] is None:
+            outputs_split[i] = torch.cat(outputs_split[i], dim=dim[i])
+        else:
+            outputs_split[i] = torch.stack(outputs_split[i], dim=new_dim[i])
+    if is_single_tensor:
+        return outputs_split[0]
+    else:
+        return outputs_split
+
+
 def cp_allgather(
     input: Union[torch.Tensor, List[torch.Tensor]],
     mapping: Mapping,

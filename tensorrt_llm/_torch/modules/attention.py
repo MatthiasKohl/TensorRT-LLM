@@ -15,7 +15,7 @@ from ..attention_backend.interface import (AttentionBackend,
                                            PositionalEmbeddingParams,
                                            PredefinedAttentionMask)
 from ..attention_backend.utils import create_attention, get_attention_backend
-from ..distributed import AllReduceParams, cp_allgather
+from ..distributed import AllReduceParams, alltoall
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
 from ..utils import Fp4QuantizedTensor, get_model_extra_attrs
@@ -498,8 +498,14 @@ class MLA(nn.Module):
 
         assert self.num_heads % tp_size == 0
         self.num_heads = self.num_heads // tp_size
-        self.num_key_value_heads = (self.num_key_value_heads + tp_size -
-                                    1) // tp_size
+        self.num_key_value_heads_tp = (self.num_key_value_heads + tp_size -
+                                       1) // tp_size
+        if cp_size > 1:
+            assert self.num_key_value_heads % (tp_size * cp_size) == 0
+            self.num_key_value_heads_tp_cp = self.num_key_value_heads_tp // (
+                tp_size * cp_size)
+        else:
+            self.num_key_value_heads_tp_cp = self.num_key_value_heads_tp
 
         rms_norm_eps = getattr(config.pretrained_config, "rms_norm_eps", 1e-6)
         quant_config = config.get_quant_config()
@@ -577,12 +583,22 @@ class MLA(nn.Module):
             requires_grad=False,
         )
 
+        mapping_o = Mapping(
+            world_size=tp_size * pp_size * cp_size,
+            tp_size=tp_size * cp_size,
+            pp_size=pp_size,
+            cp_size=1,
+            rank=self.mapping.rank,
+            gpus_per_node=self.mapping.gpus_per_node,
+            enable_attention_dp=self.mapping.enable_attention_dp,
+        )
         self.o_proj = Linear(
-            self.num_key_value_heads * self.v_head_dim * tp_size,
+            self.num_key_value_heads_tp_cp * self.v_head_dim * tp_size *
+            cp_size,
             self.hidden_size,
             bias=self.dense_bias,
             dtype=dtype,
-            mapping=mapping,
+            mapping=mapping_o,
             tensor_parallel_mode=TensorParallelMode.ROW,
             quant_config=quant_config,
             skip_create_weights_in_init=config.skip_create_weights_in_init,
@@ -603,7 +619,7 @@ class MLA(nn.Module):
             self.layer_idx,
             self.num_heads,
             head_dim=self.qk_head_dim,
-            num_kv_heads=self.num_key_value_heads,
+            num_kv_heads=self.num_key_value_heads_tp,
             pos_embd_params=pos_embd_params,
             quant_config=quant_config,
             q_scaling=q_scaling,
@@ -722,10 +738,10 @@ class MLA(nn.Module):
                       attn_metadata: AttentionMetadata, **kwargs):
         if self.mapping.cp_size > 1 and self.mapping.cp_config.get(
                 "cp_type") == CpType.HELIX:
-            # partial_o: [num_tokens, num_heads * v_head_dim]
-            # softmax_stats: [num_tokens, num_heads, 2]
+            # partial_o: [num_tokens, num_heads_tp * v_head_dim]
+            # softmax_stats: [num_tokens, num_heads_tp, 2]
             softmax_stats = torch.empty(q.shape[0],
-                                        self.num_heads,
+                                        self.num_key_value_heads_tp,
                                         2,
                                         device=q.device,
                                         dtype=torch.float32)
@@ -738,31 +754,31 @@ class MLA(nn.Module):
                 **kwargs)
             # this is the post-processing of helix parallel attention,
             # similar to the post-processing of ring attention
-            v_head_dim = partial_o.shape[-1] // self.num_heads
-            all_gathered = cp_allgather([partial_o, softmax_stats],
-                                        self.mapping,
-                                        dim=0)
-            # [num_tokens, num_heads * v_head_dim] -> [cp_size, num_tokens, num_heads * v_head_dim]
-            gathered_o = all_gathered[0].view(self.mapping.cp_size,
-                                              *partial_o.shape)
-            # [num_tokens, num_heads, 2] -> [cp_size, num_tokens, num_heads, 2]
-            gathered_stats = all_gathered[1].view(self.mapping.cp_size,
-                                                  *softmax_stats.shape)
+            v_head_dim = partial_o.shape[-1] // self.num_key_value_heads_tp
+            # note: if num_heads is a multiple of cp_size, we split this correctly here
+            # gathered_o: [cp_size, num_tokens, num_heads_tp_cp * v_head_dim]
+            # gathered_stats: [cp_size, num_tokens, num_heads_tp_cp, 2]
+            gathered_o, gathered_stats = alltoall(
+                [partial_o, softmax_stats],
+                self.mapping.cp_group,
+                dim=[-1, 1],
+                new_dim=[0, 0],
+            )
             # [cp_size, num_tokens, num_heads] -> [1, num_tokens, num_heads]
             global_max = torch.max(gathered_stats[..., 0], dim=0,
                                    keepdim=True)[0]
-            # [cp_size, num_tokens, num_heads]
+            # [cp_size, num_tokens, num_heads_tp_cp]
             corrected_max = gathered_stats[..., 0] - global_max
             corrected_max_exp = torch.exp(corrected_max)
             corrected_sum = gathered_stats[..., 1] * corrected_max_exp
-            # [cp_size, num_tokens, num_heads] -> [1, num_tokens, num_heads]
+            # [cp_size, num_tokens, num_heads_tp_cp] -> [1, num_tokens, num_heads_tp_cp]
             global_sum = torch.sum(corrected_sum, dim=0, keepdim=True)
-            # [cp_size, num_tokens, num_heads] -> [cp_size, num_tokens, num_heads, 1]
+            # [cp_size, num_tokens, num_heads_tp_cp] -> [cp_size, num_tokens, num_heads_tp_cp, 1]
             correction = torch.unsqueeze(corrected_max_exp / global_sum, -1)
-            # [cp_size, num_tokens, num_heads, v_head_dim]
+            # [cp_size, num_tokens, num_heads_tp_cp, v_head_dim]
             corrected_o = gathered_o.view(*correction.shape[:-1],
                                           v_head_dim) * correction
-            # [cp_size, num_tokens, num_heads, v_head_dim] -> [num_tokens, num_heads * v_head_dim]
+            # [cp_size, num_tokens, num_heads_tp_cp, v_head_dim] -> [num_tokens, num_heads_tp_cp * v_head_dim]
             attn_output = torch.sum(corrected_o.view(*gathered_o.shape), dim=0)
             return attn_output.to(dtype=gathered_o.dtype)
         else:
