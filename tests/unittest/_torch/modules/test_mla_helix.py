@@ -94,7 +94,8 @@ all_scenarios = [
     Scenario(batch=16, seq_len=16384),
     Scenario(batch=16, seq_len=32768),
     Scenario(batch=16, seq_len=65536),
-    Scenario(batch=16, seq_len=131072),
+    # this goes OOM
+    # Scenario(batch=16, seq_len=131072),
 ]
 
 # limit the number of test scenarios to avoid taking too long
