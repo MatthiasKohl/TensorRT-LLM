@@ -761,8 +761,8 @@ class MLA(nn.Module):
             gathered_o, gathered_stats = alltoall(
                 [partial_o, softmax_stats],
                 self.mapping.cp_group,
-                dim=[-1, 1],
-                new_dim=[0, 0],
+                dims=[-1, 1],
+                new_dims=[0, 0],
             )
             # [cp_size, num_tokens, num_heads] -> [1, num_tokens, num_heads]
             global_max = torch.max(gathered_stats[..., 0], dim=0,

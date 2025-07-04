@@ -199,7 +199,7 @@ def _setup_kv_and_metadata(scenario: Scenario, mapping: Mapping):
 def _run_mla_distributed(rank: int, world_size: int, scenario: Scenario,
                          mapping: Mapping, test_params: tuple,
                          ref_output: torch.Tensor):
-    input_ctx, position_ids_ctx, weights, ref_q, ref_latent_cache, pos_embd_params = test_params
+    input_ctx, position_ids_ctx, weights, pos_embd_params = test_params
     extra_attrs = dict()
     config = ModelConfig(mapping=mapping)
     config.extra_attrs = extra_attrs
@@ -285,6 +285,8 @@ def _run_mla_distributed(rank: int, world_size: int, scenario: Scenario,
 
     # every rank should have the same output and checks against the reference output
     # TODO sometimes, we are still producing NaNs, so we allow both elements to be NaN
+    print(f"#NaNs in ref: {ref_output.isnan().sum().item()}, "
+          f"#NaNs in output: {output.isnan().sum().item()}")
     torch.testing.assert_close(output,
                                ref_output,
                                rtol=1e-2,
@@ -346,18 +348,6 @@ def _full_test_multi_gpu(rank: int, world_size: int, scenario: Scenario):
         dtype=scenario.dtype,
     ).cuda()
     weights = mla.state_dict()
-    ref_q = torch.randn(
-        scenario.batch * scenario.seq_len,
-        scenario.num_heads *
-        (2 * (scenario.qk_nope_head_dim + scenario.qk_rope_head_dim)) +
-        scenario.num_kv_heads * scenario.v_head_dim,
-        dtype=scenario.dtype,
-        device="cuda")
-    ref_latent_cache = torch.randn(scenario.batch * scenario.seq_len,
-                                   scenario.kv_lora_rank +
-                                   scenario.qk_rope_head_dim,
-                                   dtype=scenario.dtype,
-                                   device="cuda")
     # up to this point, all ranks should have same tensors because the seed is the same
     # now we run the reference MLA on rank 0
     if rank == 0:
@@ -422,8 +412,14 @@ def _full_test_multi_gpu(rank: int, world_size: int, scenario: Scenario):
     ref_output_all = cp_allgather(ref_output, mapping=mapping, dim=0)
     # we only need the values from rank 0
     ref_output = ref_output_all.view(world_size, *ref_output.shape)[0]
-    test_params = (input_ctx, position_ids_ctx, weights, ref_q,
-                   ref_latent_cache, pos_embd_params)
+    # we update the weights s.t. o_proj.weight is split across ranks, since
+    # CP ranks become TP ranks for o_proj
+    w_dim_in_per_rank = weights["o_proj.weight"].shape[1] // world_size
+    w_dim_in_start = rank * w_dim_in_per_rank
+    w_dim_in_end = w_dim_in_start + w_dim_in_per_rank
+    weights["o_proj.weight"] = weights[
+        "o_proj.weight"][:, w_dim_in_start:w_dim_in_end]
+    test_params = (input_ctx, position_ids_ctx, weights, pos_embd_params)
     _run_mla_distributed(rank, world_size, scenario, mapping, test_params,
                          ref_output)
 

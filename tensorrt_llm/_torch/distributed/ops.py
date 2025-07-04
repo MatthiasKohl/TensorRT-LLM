@@ -231,8 +231,8 @@ def allgather(
 def alltoall(
     inputs: Union[torch.Tensor, List[torch.Tensor]],
     group: List[int],
-    dim: Union[int, List[int]] = -1,
-    new_dim: Union[Optional[int], List[Optional[int]]] = None,
+    dims: Union[int, List[int]] = -1,
+    new_dims: Union[Optional[int], List[Optional[int]]] = None,
 ) -> Union[torch.Tensor, List[torch.Tensor]]:
     '''
     Add an operation that performs a collective all-to-all across both TP and CP groups.
@@ -245,9 +245,9 @@ def alltoall(
     Args:
         inputs (Union[Tensor, List[Tensor]]): The input tensor or tensor list.
         group (List[int]): The group of ranks to participate in the all-to-all.
-        dim (Union[int, List[int]]): Split along given dimension. By default -1.
-        new_dim (Union[Optional[int], List[Optional[int]]]): The dimension to stack the splits along.
-            If None (default), the splits are concatenated along dimension `dim`.
+        dims (Union[int, List[int]]): Split along given dimension (per tensor). By default -1.
+        new_dims (Union[Optional[int], List[Optional[int]]]): The dimension to stack the splits along (per tensor).
+            If None (default), the splits are concatenated along dimension given by `dims`.
     Returns:
         The tensor when combining all splits from all participating ranks, or a list of tensors when `inputs` is a list of tensors.
     '''
@@ -260,22 +260,23 @@ def alltoall(
     is_single_tensor = isinstance(inputs, torch.Tensor)
 
     if is_single_tensor:
-        assert isinstance(dim, int)
-        assert new_dim is None or isinstance(new_dim, int)
+        assert isinstance(dims, int)
+        assert new_dims is None or isinstance(new_dims, int)
         inputs = [inputs]
-        new_dim = [new_dim]
-        dim = [dim]
-    assert len(dim) == len(inputs)
-    assert all(isinstance(d, int) for d in dim)
-    assert len(new_dim) == len(inputs)
-    assert all(new_dim is None or isinstance(d, int) for d in new_dim)
+        new_dims = [new_dims]
+        dims = [dims]
+    assert len(dims) == len(inputs)
+    assert all(isinstance(dim, int) for dim in dims)
+    assert len(new_dims) == len(inputs)
+    assert all(new_dim is None or isinstance(new_dim, int)
+               for new_dim in new_dims)
 
     op_inputs = []
 
-    for inp in inputs:
+    for inp, dim, new_dim in zip(inputs, dims, new_dims):
         size_per_rank, rem = divmod(inp.shape[dim], n_ranks)
         assert rem == 0, \
-            f"input.shape[{dim}] must be divisible by n_ranks ({n_ranks}), but got shape {inp.shape}"
+            f"input.shape[{dim}] must be divisible by n_ranks ({n_ranks}), but got shape {inp.shape} for rank {mapping.tp_rank}"
 
         # we split the input into n_ranks equal parts along dimension `dim`
         # note: the requirement for the C++ op is that all parts have same shape,
@@ -293,10 +294,10 @@ def alltoall(
         outputs[i * n_ranks:(i + 1) * n_ranks] for i in range(len(inputs))
     ]
     for i in range(len(inputs)):
-        if new_dim[i] is None:
-            outputs_split[i] = torch.cat(outputs_split[i], dim=dim[i])
+        if new_dims[i] is None:
+            outputs_split[i] = torch.cat(outputs_split[i], dim=dims[i])
         else:
-            outputs_split[i] = torch.stack(outputs_split[i], dim=new_dim[i])
+            outputs_split[i] = torch.stack(outputs_split[i], dim=new_dims[i])
     if is_single_tensor:
         return outputs_split[0]
     else:
