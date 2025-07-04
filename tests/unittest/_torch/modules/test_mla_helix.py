@@ -196,6 +196,15 @@ def _setup_kv_and_metadata(scenario: Scenario, mapping: Mapping):
     return kv_cache_manager, attn_metadata
 
 
+def _copy_to_cp(weights, param_name, dim, rank, world_size):
+    w_dim_per_rank = weights[param_name].shape[dim] // world_size
+    w_dim_start = rank * w_dim_per_rank
+    w_dim_end = w_dim_start + w_dim_per_rank
+    slices = [slice(None)] * weights[param_name].ndim
+    slices[dim] = slice(w_dim_start, w_dim_end)
+    weights[param_name] = weights[param_name][slices]
+
+
 def _run_mla_distributed(rank: int, world_size: int, scenario: Scenario,
                          mapping: Mapping, test_params: tuple,
                          ref_output: torch.Tensor):
@@ -414,11 +423,8 @@ def _full_test_multi_gpu(rank: int, world_size: int, scenario: Scenario):
     ref_output = ref_output_all.view(world_size, *ref_output.shape)[0]
     # we update the weights s.t. o_proj.weight is split across ranks, since
     # CP ranks become TP ranks for o_proj
-    w_dim_in_per_rank = weights["o_proj.weight"].shape[1] // world_size
-    w_dim_in_start = rank * w_dim_in_per_rank
-    w_dim_in_end = w_dim_in_start + w_dim_in_per_rank
-    weights["o_proj.weight"] = weights[
-        "o_proj.weight"][:, w_dim_in_start:w_dim_in_end]
+    _copy_to_cp(weights, "o_proj.weight", 1, rank, world_size)
+    _copy_to_cp(weights, "v_b_proj", 0, rank, world_size)
     test_params = (input_ctx, position_ids_ctx, weights, pos_embd_params)
     _run_mla_distributed(rank, world_size, scenario, mapping, test_params,
                          ref_output)

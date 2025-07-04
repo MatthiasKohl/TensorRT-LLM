@@ -444,7 +444,7 @@ class MLA(nn.Module):
         self.hidden_size = hidden_size
         self.num_heads = num_attention_heads
         self.num_key_value_heads = num_key_value_heads
-        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        assert self.num_heads == self.num_key_value_heads, "num_heads must be equal to num_key_value_heads"
         self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_rope_head_dim = qk_rope_head_dim
         self.qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
@@ -496,16 +496,9 @@ class MLA(nn.Module):
             enable_attention_dp=self.mapping.enable_attention_dp,
         )
 
-        assert self.num_heads % tp_size == 0
-        self.num_heads = self.num_heads // tp_size
-        self.num_key_value_heads_tp = (self.num_key_value_heads + tp_size -
-                                       1) // tp_size
-        if cp_size > 1:
-            assert self.num_key_value_heads % (tp_size * cp_size) == 0
-            self.num_key_value_heads_tp_cp = self.num_key_value_heads_tp // (
-                tp_size * cp_size)
-        else:
-            self.num_key_value_heads_tp_cp = self.num_key_value_heads_tp
+        assert self.num_heads % (tp_size * cp_size) == 0
+        self.num_heads_tp = self.num_heads // tp_size
+        self.num_heads_tp_cp = self.num_heads_tp // cp_size
 
         rms_norm_eps = getattr(config.pretrained_config, "rms_norm_eps", 1e-6)
         quant_config = config.get_quant_config()
@@ -527,7 +520,7 @@ class MLA(nn.Module):
 
             self.q_b_proj = Linear(
                 self.q_lora_rank,
-                tp_size * self.num_heads * self.qk_head_dim,
+                tp_size * self.num_heads_tp * self.qk_head_dim,
                 bias=bias,
                 dtype=dtype,
                 mapping=mapping,
@@ -547,7 +540,7 @@ class MLA(nn.Module):
 
             self.q_proj = Linear(
                 self.q_lora_rank,
-                tp_size * self.num_heads * self.qk_head_dim,
+                tp_size * self.num_heads_tp * self.qk_head_dim,
                 bias=bias,
                 dtype=dtype,
                 mapping=mapping,
@@ -563,7 +556,7 @@ class MLA(nn.Module):
 
         self.kv_b_proj = Linear(
             self.kv_lora_rank,
-            tp_size * self.num_heads *
+            tp_size * self.num_heads_tp *
             (self.qk_nope_head_dim + self.v_head_dim),
             bias=bias,
             dtype=dtype,
@@ -577,7 +570,7 @@ class MLA(nn.Module):
         # Used in forward_generation only
         self.v_b_proj = nn.Parameter(
             torch.empty(
-                (self.num_heads, self.v_head_dim, self.kv_lora_rank),
+                (self.num_heads_tp_cp, self.v_head_dim, self.kv_lora_rank),
                 dtype=dtype,
             ),
             requires_grad=False,
@@ -593,8 +586,7 @@ class MLA(nn.Module):
             enable_attention_dp=self.mapping.enable_attention_dp,
         )
         self.o_proj = Linear(
-            self.num_key_value_heads_tp_cp * self.v_head_dim * tp_size *
-            cp_size,
+            self.num_heads_tp_cp * self.v_head_dim * tp_size * cp_size,
             self.hidden_size,
             bias=self.dense_bias,
             dtype=dtype,
@@ -617,9 +609,9 @@ class MLA(nn.Module):
         self.mha = create_attention(
             config.attn_backend,
             self.layer_idx,
-            self.num_heads,
+            self.num_heads_tp,
             head_dim=self.qk_head_dim,
-            num_kv_heads=self.num_key_value_heads_tp,
+            num_kv_heads=self.num_heads_tp,
             pos_embd_params=pos_embd_params,
             quant_config=quant_config,
             q_scaling=q_scaling,
@@ -636,7 +628,7 @@ class MLA(nn.Module):
         self.mqa = create_attention(
             config.attn_backend,
             self.layer_idx,
-            self.num_heads,
+            self.num_heads_tp,
             head_dim=self.kv_lora_rank + self.qk_rope_head_dim,
             num_kv_heads=1,
             pos_embd_params=pos_embd_params,
@@ -684,7 +676,7 @@ class MLA(nn.Module):
         mla_weight_dtype = torch.float8_e4m3fn if has_fp8_block_scales else self.dtype
         self.k_b_proj_trans = nn.Parameter(
             torch.empty(
-                (self.num_heads, self.kv_lora_rank, self.qk_nope_head_dim),
+                (self.num_heads_tp, self.kv_lora_rank, self.qk_nope_head_dim),
                 dtype=mla_weight_dtype,
             ),
             requires_grad=False,
@@ -694,7 +686,7 @@ class MLA(nn.Module):
             self.k_b_proj_trans_scale = nn.Parameter(
                 torch.empty(
                     (
-                        self.num_heads,
+                        self.num_heads_tp,
                         self.kv_lora_rank // 128,
                         self.qk_nope_head_dim // 128,
                     ),
@@ -707,7 +699,7 @@ class MLA(nn.Module):
             self.v_b_proj_scale = nn.Parameter(
                 torch.empty(
                     (
-                        self.num_heads,
+                        self.num_heads_tp,
                         self.v_head_dim // 128,
                         self.kv_lora_rank // 128,
                     ),
@@ -725,11 +717,11 @@ class MLA(nn.Module):
         k_pe: torch.Tensor,
         position_ids: torch.Tensor,
     ) -> torch.Tensor:
-        q = q.view(-1, self.num_heads, self.qk_head_dim)
+        q = q.view(-1, self.num_heads_tp, self.qk_head_dim)
         q_pe = q[..., self.qk_nope_head_dim:].reshape(
-            -1, self.num_heads * self.qk_rope_head_dim)
+            -1, self.num_heads_tp * self.qk_rope_head_dim)
         q_pe, k_pe = self.rotary_emb(position_ids, [q_pe, k_pe])
-        q[..., self.qk_nope_head_dim:] = q_pe.view(-1, self.num_heads,
+        q[..., self.qk_nope_head_dim:] = q_pe.view(-1, self.num_heads_tp,
                                                    self.qk_rope_head_dim)
         return k_pe
 
@@ -741,7 +733,7 @@ class MLA(nn.Module):
             # partial_o: [num_tokens, num_heads_tp * v_head_dim]
             # softmax_stats: [num_tokens, num_heads_tp, 2]
             softmax_stats = torch.empty(q.shape[0],
-                                        self.num_key_value_heads_tp,
+                                        self.num_heads_tp,
                                         2,
                                         device=q.device,
                                         dtype=torch.float32)
@@ -754,8 +746,8 @@ class MLA(nn.Module):
                 **kwargs)
             # this is the post-processing of helix parallel attention,
             # similar to the post-processing of ring attention
-            v_head_dim = partial_o.shape[-1] // self.num_key_value_heads_tp
-            # note: if num_heads is a multiple of cp_size, we split this correctly here
+            v_head_dim = partial_o.shape[-1] // self.num_heads_tp
+            # note: if num_heads_tp is a multiple of cp_size, we split this correctly here
             # gathered_o: [cp_size, num_tokens, num_heads_tp_cp * v_head_dim]
             # gathered_stats: [cp_size, num_tokens, num_heads_tp_cp, 2]
             gathered_o, gathered_stats = alltoall(
@@ -764,7 +756,7 @@ class MLA(nn.Module):
                 dims=[-1, 1],
                 new_dims=[0, 0],
             )
-            # [cp_size, num_tokens, num_heads] -> [1, num_tokens, num_heads]
+            # [cp_size, num_tokens, num_heads_tp_cp] -> [1, num_tokens, num_heads_tp_cp]
             global_max = torch.max(gathered_stats[..., 0], dim=0,
                                    keepdim=True)[0]
             # [cp_size, num_tokens, num_heads_tp_cp]
@@ -923,19 +915,19 @@ class MLA(nn.Module):
         kv = self.kv_b_proj(compressed_kv)
         k_nope, v = kv.split(
             [
-                self.num_heads * self.qk_nope_head_dim,
-                self.num_heads * self.v_head_dim
+                self.num_heads_tp * self.qk_nope_head_dim,
+                self.num_heads_tp * self.v_head_dim
             ],
             -1,
         )
 
-        k = torch.empty_like(q).view(-1, self.num_heads, self.qk_head_dim)
-        k[..., :self.qk_nope_head_dim] = k_nope.view(-1, self.num_heads,
+        k = torch.empty_like(q).view(-1, self.num_heads_tp, self.qk_head_dim)
+        k[..., :self.qk_nope_head_dim] = k_nope.view(-1, self.num_heads_tp,
                                                      self.qk_nope_head_dim)
         if self.apply_rotary_emb:
             k[..., self.qk_nope_head_dim:] = k_pe.view(-1, 1,
                                                        self.qk_rope_head_dim)
-        k = k.view(-1, self.num_heads * self.qk_head_dim)
+        k = k.view(-1, self.num_heads_tp * self.qk_head_dim)
 
         # May concat q(including q_pe), k + k_pe, v together
         q, k, v = self._maybe_concat_qkv(q, k, v)
@@ -986,14 +978,14 @@ class MLA(nn.Module):
         full_kv = self.kv_b_proj(full_compressed_kv)
         full_k_nope, full_v = full_kv.split(
             [
-                self.num_heads * self.qk_nope_head_dim,
-                self.num_heads * self.v_head_dim
+                self.num_heads_tp * self.qk_nope_head_dim,
+                self.num_heads_tp * self.v_head_dim
             ],
             -1,
         )
-        full_k_nope = full_k_nope.view(-1, self.num_heads,
+        full_k_nope = full_k_nope.view(-1, self.num_heads_tp,
                                        self.qk_nope_head_dim)
-        full_v = full_v.view(-1, self.num_heads, self.v_head_dim)
+        full_v = full_v.view(-1, self.num_heads_tp, self.v_head_dim)
 
         # build paged_full_kv
         tokens_per_block = attn_metadata.kv_cache_manager.tokens_per_block
@@ -1001,7 +993,7 @@ class MLA(nn.Module):
         paged_full_kv = torch.empty([
             attn_metadata.num_contexts, 2,
             (attn_metadata.max_ctx_kv_len + tokens_per_block - 1) //
-            tokens_per_block, self.num_heads, tokens_per_block,
+            tokens_per_block, self.num_heads_tp, tokens_per_block,
             max(self.qk_nope_head_dim + self.qk_rope_head_dim, self.v_head_dim)
         ],
                                     dtype=q.dtype,
@@ -1061,22 +1053,22 @@ class MLA(nn.Module):
 
         # [toal_token_q, num_heads, 2] -> [toal_token_q, num_heads] float2
         self.softmax_stats_tensor = torch.empty(
-            (attn_metadata.num_ctx_tokens, self.num_heads, 2),
+            (attn_metadata.num_ctx_tokens, self.num_heads_tp, 2),
             dtype=torch.float,
             device='cuda',
         )
         self.temp_softmax_stats_tensor = torch.empty(
-            (attn_metadata.num_ctx_tokens, self.num_heads, 2),
+            (attn_metadata.num_ctx_tokens, self.num_heads_tp, 2),
             dtype=torch.float,
             device='cuda',
         )
         if output is None:
             attn_output = q.new_empty(
-                (q.size(0), self.num_heads * self.v_head_dim), dtype=q.dtype)
+                (q.size(0), self.num_heads_tp * self.v_head_dim), dtype=q.dtype)
         else:
             attn_output = output
         temp_attn_output = q.new_empty(
-            (q.size(0), self.num_heads * self.v_head_dim), dtype=q.dtype)
+            (q.size(0), self.num_heads_tp * self.v_head_dim), dtype=q.dtype)
 
         # use fake cached_cu_seq_len for chunked loop
         origin_kv_lens_cuda_runtime = attn_metadata.kv_lens_cuda_runtime
@@ -1105,7 +1097,7 @@ class MLA(nn.Module):
             full_kv = torch.zeros([
                 attn_metadata.num_contexts, 2,
                 (chunk_size + tokens_per_block - 1) // tokens_per_block,
-                self.num_heads, tokens_per_block,
+                self.num_heads_tp, tokens_per_block,
                 max(self.qk_nope_head_dim + self.qk_rope_head_dim,
                     self.v_head_dim)
             ],
@@ -1161,7 +1153,7 @@ class MLA(nn.Module):
         full_kv = torch.zeros([
             attn_metadata.num_contexts, 2,
             (attn_metadata.max_ctx_seq_len + tokens_per_block - 1) //
-            tokens_per_block, self.num_heads, tokens_per_block,
+            tokens_per_block, self.num_heads_tp, tokens_per_block,
             max(self.qk_nope_head_dim + self.qk_rope_head_dim, self.v_head_dim)
         ],
                               dtype=q.dtype,
@@ -1231,14 +1223,14 @@ class MLA(nn.Module):
             latent_cache: Optional[torch.Tensor] = None,
             output: Optional[torch.Tensor] = None) -> torch.Tensor:
         num_tokens = q.shape[0]
-        q_nope, q_pe = q.view([-1, self.num_heads, self.qk_head_dim]).split(
+        q_nope, q_pe = q.view([-1, self.num_heads_tp, self.qk_head_dim]).split(
             [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
         # fused_q contains 1) the result of the following bmm with shape [num_tokens, num_heads, kv_lora_rank]
         # 2) rope(q_pe) with shape [num_tokens, num_heads, qk_rope_head_dim]. rope is applied inside AttentionOp
         fused_q = torch.empty(
             [
-                num_tokens, self.num_heads,
+                num_tokens, self.num_heads_tp,
                 (self.kv_lora_rank + self.qk_rope_head_dim)
             ],
             dtype=q.dtype,
@@ -1271,7 +1263,7 @@ class MLA(nn.Module):
             fused_q[..., self.kv_lora_rank:] = q_pe
         fused_q = fused_q.view([
             num_tokens,
-            self.num_heads * (self.kv_lora_rank + self.qk_rope_head_dim)
+            self.num_heads_tp * (self.kv_lora_rank + self.qk_rope_head_dim)
         ])
 
         # out_scale = getattr(self.o_proj, "inv_input_scale", None)
@@ -1290,20 +1282,23 @@ class MLA(nn.Module):
         )
         fused_q = None
 
-        assert (attn_out_latent.shape[0] == q.shape[0] and
-                attn_out_latent.shape[1] == self.num_heads * self.kv_lora_rank)
+        # note: if we do not have CP, then num_heads_tp_cp == num_heads_tp
+        assert (attn_out_latent.shape[0] == q.shape[0]
+                and attn_out_latent.shape[1]
+                == self.num_heads_tp_cp * self.kv_lora_rank)
 
         # [seq, num_heads, kv_lora_rank]
         attn_out_latent = attn_out_latent.view(
-            [-1, self.num_heads, self.kv_lora_rank])
+            [-1, self.num_heads_tp_cp, self.kv_lora_rank])
 
         # [seq, num_heads * v_head_dim]
         output = output if output is not None else torch.empty(
-            [num_tokens, self.num_heads * self.v_head_dim],
+            [num_tokens, self.num_heads_tp_cp * self.v_head_dim],
             dtype=attn_out_latent.dtype,
             device=attn_out_latent.device)
 
-        attn_output = output.view([num_tokens, self.num_heads, self.v_head_dim])
+        attn_output = output.view(
+            [num_tokens, self.num_heads_tp_cp, self.v_head_dim])
 
         if self.v_b_proj.dtype == torch.bfloat16:
             # [num_heads, seq, kv_lora_rank] x [num_heads, kv_lora_rank, v_head_dim]
