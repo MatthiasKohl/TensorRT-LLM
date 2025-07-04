@@ -781,7 +781,7 @@ class MLA(nn.Module):
 
     def create_output(self, hidden_states: torch.Tensor):
         num_tokens = hidden_states.shape[0]
-        hidden_size = self.o_proj.in_features
+        hidden_size = self.o_proj.in_features // self.mapping.cp_size
         return hidden_states.new_empty([num_tokens, hidden_size],
                                        dtype=hidden_states.dtype)
 
@@ -1337,6 +1337,7 @@ class MLA(nn.Module):
                               hidden_states,
                               attn_metadata,
                               output=attn_output)
-        attn_output = self.o_proj(attn_output,
+        attn_output = self.o_proj(attn_output.repeat(
+            1, self.mapping.cp_size).contiguous(),
                                   all_reduce_params=all_reduce_params)
         return attn_output
