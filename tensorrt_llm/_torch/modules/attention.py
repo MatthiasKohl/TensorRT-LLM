@@ -568,6 +568,7 @@ class MLA(nn.Module):
         # This parameter will view into self.kv_b_proj.weight after loading weights.
         # For dummy weight initialization, this parameter is initialized with empty tensor.
         # Used in forward_generation only
+        # TODO: loading weights needs to be aware of cp as well and split v_b_proj accordingly
         self.v_b_proj = nn.Parameter(
             torch.empty(
                 (self.num_heads_tp_cp, self.v_head_dim, self.kv_lora_rank),
@@ -585,12 +586,14 @@ class MLA(nn.Module):
             gpus_per_node=self.mapping.gpus_per_node,
             enable_attention_dp=self.mapping.enable_attention_dp,
         )
+        # TODO need to debug this: it looks like we're getting an illegal memory access when
+        # using tp + cp parallelism here, but need to further debug.
         self.o_proj = Linear(
             self.num_heads_tp_cp * self.v_head_dim * tp_size * cp_size,
             self.hidden_size,
             bias=self.dense_bias,
             dtype=dtype,
-            mapping=mapping_o,
+            mapping=mapping,
             tensor_parallel_mode=TensorParallelMode.ROW,
             quant_config=quant_config,
             skip_create_weights_in_init=config.skip_create_weights_in_init,
@@ -699,7 +702,7 @@ class MLA(nn.Module):
             self.v_b_proj_scale = nn.Parameter(
                 torch.empty(
                     (
-                        self.num_heads_tp_cp,
+                        self.num_heads_tp,
                         self.v_head_dim // 128,
                         self.kv_lora_rank // 128,
                     ),
@@ -730,7 +733,7 @@ class MLA(nn.Module):
                       attn_metadata: AttentionMetadata, **kwargs):
         if self.mapping.cp_size > 1 and self.mapping.cp_config.get(
                 "cp_type") == CpType.HELIX:
-            # partial_o: [num_tokens, num_heads_tp * v_head_dim]
+            # partial_o: [num_tokens, num_heads_tp * kv_lora_rank]
             # softmax_stats: [num_tokens, num_heads_tp, 2]
             softmax_stats = torch.empty(q.shape[0],
                                         self.num_heads_tp,
@@ -746,9 +749,9 @@ class MLA(nn.Module):
                 **kwargs)
             # this is the post-processing of helix parallel attention,
             # similar to the post-processing of ring attention
-            v_head_dim = partial_o.shape[-1] // self.num_heads_tp
+            kv_lora_rank = partial_o.shape[-1] // self.num_heads_tp
             # note: if num_heads_tp is a multiple of cp_size, we split this correctly here
-            # gathered_o: [cp_size, num_tokens, num_heads_tp_cp * v_head_dim]
+            # gathered_o: [cp_size, num_tokens, num_heads_tp_cp * kv_lora_rank]
             # gathered_stats: [cp_size, num_tokens, num_heads_tp_cp, 2]
             gathered_o, gathered_stats = alltoall(
                 [partial_o, softmax_stats],
@@ -767,10 +770,10 @@ class MLA(nn.Module):
             global_sum = torch.sum(corrected_sum, dim=0, keepdim=True)
             # [cp_size, num_tokens, num_heads_tp_cp] -> [cp_size, num_tokens, num_heads_tp_cp, 1]
             correction = torch.unsqueeze(corrected_max_exp / global_sum, -1)
-            # [cp_size, num_tokens, num_heads_tp_cp, v_head_dim]
+            # [cp_size, num_tokens, num_heads_tp_cp, kv_lora_rank]
             corrected_o = gathered_o.view(*correction.shape[:-1],
-                                          v_head_dim) * correction
-            # [cp_size, num_tokens, num_heads_tp_cp, v_head_dim] -> [num_tokens, num_heads_tp_cp * v_head_dim]
+                                          kv_lora_rank) * correction
+            # [cp_size, num_tokens, num_heads_tp_cp, kv_lora_rank] -> [num_tokens, num_heads_tp_cp * kv_lora_rank]
             attn_output = torch.sum(corrected_o.view(*gathered_o.shape), dim=0)
             return attn_output.to(dtype=gathered_o.dtype)
         else:
