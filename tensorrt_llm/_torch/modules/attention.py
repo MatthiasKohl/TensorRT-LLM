@@ -699,7 +699,7 @@ class MLA(nn.Module):
             self.v_b_proj_scale = nn.Parameter(
                 torch.empty(
                     (
-                        self.num_heads_tp,
+                        self.num_heads_tp_cp,
                         self.v_head_dim // 128,
                         self.kv_lora_rank // 128,
                     ),

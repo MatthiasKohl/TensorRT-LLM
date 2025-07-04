@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import cloudpickle
 import pytest
 import torch
+import torch.nn as nn
 from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor
 
@@ -196,6 +197,57 @@ def _setup_kv_and_metadata(scenario: Scenario, mapping: Mapping):
     return kv_cache_manager, attn_metadata
 
 
+def _generate_random_weights(mla: MLA):
+    # Helper to init a tensor
+    def init_uniform(tensor, a=-1.0, b=1.0):
+        if tensor is not None:
+            nn.init.uniform_(tensor, a=a, b=b)
+
+    def init_block_scale(tensor, orig_tensor):
+        if tensor is None or orig_tensor is None:
+            return
+        x = orig_tensor.view(*orig_tensor.shape[:-2],
+                             orig_tensor.shape[-2] // 128, 128,
+                             orig_tensor.shape[-1] // 128, 128)
+        scale = x.abs().amax(dim=(-3, -1)) / 448.
+        tensor.fill_(scale)
+
+    # Linear modules
+    for name in ["fused_a", "kv_b_proj", "o_proj"]:
+        mod = getattr(mla, name, None)
+        if mod is not None:
+            init_uniform(mod.weight)
+            if hasattr(mod, "bias"):
+                init_uniform(mod.bias)
+
+    if hasattr(mla, "v_b_proj"):
+        init_uniform(mla.v_b_proj)
+
+    # RMSNorm modules
+    for name in ["kv_a_layernorm", "q_a_layernorm"]:
+        mod = getattr(mla, name, None)
+        if mod is not None and hasattr(mod, "weight"):
+            init_uniform(mod.weight, a=0.9, b=1.1)
+
+    # q_b_proj and q_proj (q_proj only in lite mode, aliased as q_b_proj)
+    for name in ["q_b_proj", "q_proj"]:
+        mod = getattr(mla, name, None)
+        if mod is not None:
+            init_uniform(mod.weight)
+            if hasattr(mod, "bias"):
+                init_uniform(mod.bias)
+
+    # k_b_proj_trans (created in create_weights)
+    if hasattr(mla, "k_b_proj_trans"):
+        init_uniform(mla.k_b_proj_trans)
+    # k_b_proj_trans_scale (optional)
+    if hasattr(mla, "k_b_proj_trans_scale"):
+        init_block_scale(mla.k_b_proj_trans_scale, mla.k_b_proj_trans)
+    # v_b_proj_scale (optional)
+    if hasattr(mla, "v_b_proj_scale"):
+        init_block_scale(mla.v_b_proj_scale, mla.v_b_proj)
+
+
 def _copy_to_cp(weights, param_name, dim, rank, world_size):
     w_dim_per_rank = weights[param_name].shape[dim] // world_size
     w_dim_start = rank * w_dim_per_rank
@@ -229,7 +281,10 @@ def _run_mla_distributed(rank: int, world_size: int, scenario: Scenario,
         dtype=scenario.dtype,
         config=config,
     ).cuda()
-
+    # above should have the same config as the reference MLA except for the mapping
+    # we update the weights accordingly and should be able to load them
+    _copy_to_cp(weights, "o_proj.weight", 1, rank, world_size)
+    _copy_to_cp(weights, "v_b_proj", 0, rank, world_size)
     mla.load_state_dict(weights)
     # Set up KVCacheManager and attn_metadata for distributed
     kv_cache_manager, attn_metadata = _setup_kv_and_metadata(scenario, mapping)
@@ -293,14 +348,7 @@ def _run_mla_distributed(rank: int, world_size: int, scenario: Scenario,
     kv_cache_manager.shutdown()
 
     # every rank should have the same output and checks against the reference output
-    # TODO sometimes, we are still producing NaNs, so we allow both elements to be NaN
-    print(f"#NaNs in ref: {ref_output.isnan().sum().item()}, "
-          f"#NaNs in output: {output.isnan().sum().item()}")
-    torch.testing.assert_close(output,
-                               ref_output,
-                               rtol=1e-2,
-                               atol=1e-2,
-                               equal_nan=True)
+    torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=1e-2)
 
 
 @torch.inference_mode
@@ -356,6 +404,7 @@ def _full_test_multi_gpu(rank: int, world_size: int, scenario: Scenario):
         layer_idx=0,
         dtype=scenario.dtype,
     ).cuda()
+    _generate_random_weights(mla)
     weights = mla.state_dict()
     # up to this point, all ranks should have same tensors because the seed is the same
     # now we run the reference MLA on rank 0
@@ -421,10 +470,6 @@ def _full_test_multi_gpu(rank: int, world_size: int, scenario: Scenario):
     ref_output_all = cp_allgather(ref_output, mapping=mapping, dim=0)
     # we only need the values from rank 0
     ref_output = ref_output_all.view(world_size, *ref_output.shape)[0]
-    # we update the weights s.t. o_proj.weight is split across ranks, since
-    # CP ranks become TP ranks for o_proj
-    _copy_to_cp(weights, "o_proj.weight", 1, rank, world_size)
-    _copy_to_cp(weights, "v_b_proj", 0, rank, world_size)
     test_params = (input_ctx, position_ids_ctx, weights, pos_embd_params)
     _run_mla_distributed(rank, world_size, scenario, mapping, test_params,
                          ref_output)
