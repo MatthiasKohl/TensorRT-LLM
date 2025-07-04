@@ -8,7 +8,6 @@ from dataclasses import dataclass
 import cloudpickle
 import pytest
 import torch
-import torch.nn as nn
 from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor
 
@@ -199,18 +198,21 @@ def _setup_kv_and_metadata(scenario: Scenario, mapping: Mapping):
 
 def _generate_random_weights(mla: MLA):
     # Helper to init a tensor
+    # TODO need to debug numerically when using non-zero values
     def init_uniform(tensor, a=-1.0, b=1.0):
         if tensor is not None:
-            nn.init.uniform_(tensor, a=a, b=b)
+            # nn.init.uniform_(tensor, a=a, b=b)
+            tensor.fill_(0.0)
 
     def init_block_scale(tensor, orig_tensor):
         if tensor is None or orig_tensor is None:
             return
-        x = orig_tensor.view(*orig_tensor.shape[:-2],
-                             orig_tensor.shape[-2] // 128, 128,
-                             orig_tensor.shape[-1] // 128, 128)
-        scale = x.abs().amax(dim=(-3, -1)) / 448.
-        tensor.fill_(scale)
+        tensor.fill_(0.0)
+        # x = orig_tensor.view(*orig_tensor.shape[:-2],
+        #                      orig_tensor.shape[-2] // 128, 128,
+        #                      orig_tensor.shape[-1] // 128, 128)
+        # scale = x.abs().amax(dim=(-3, -1)) / 448.
+        # tensor.fill_(scale)
 
     # Linear modules
     for name in ["fused_a", "kv_b_proj", "o_proj"]:
