@@ -56,16 +56,16 @@ public:
         return 0;
     }
 
-    std::vector<torch::Tensor> run(torch::TensorList input_list, torch::optional<int> num_lists)
+    std::vector<torch::Tensor> run(torch::TensorList input_list, torch::optional<int64_t> num_lists)
     {
         TLLM_CHECK_WITH_INFO(mNcclComm.get() != nullptr, "mNcclComm should be initialized before used");
-        auto num_lists_ = num_lists.value_or(1);
+        auto num_lists_ = static_cast<int>(num_lists.value_or(1));
+        auto num_ranks = static_cast<int>(mGroup.size());
         // note: ensures that input_list size > 0
-        TLLM_CHECK_WITH_INFO(input_list.size() == mGroup.size() * num_lists_,
+        TLLM_CHECK_WITH_INFO(static_cast<int>(input_list.size()) == num_ranks * num_lists_,
             "input_list size should be equal to group size * num_lists");
         auto stream = at::cuda::getCurrentCUDAStream(input_list[0].get_device());
         ncclGroupStart();
-        auto num_ranks = static_cast<int>(mGroup.size());
         std::vector<torch::Tensor> output_list;
         for (int il = 0; il < num_lists_; ++il)
         {
@@ -95,7 +95,7 @@ private:
 #endif // ENABLE_MULTI_DEVICE
 
 std::vector<torch::Tensor> alltoall(
-    torch::TensorList input_list, torch::List<int64_t> group_, torch::optional<int> num_lists)
+    torch::TensorList input_list, torch::List<int64_t> group_, torch::optional<int64_t> num_lists)
 {
 #if ENABLE_MULTI_DEVICE
     std::set<int> group;
