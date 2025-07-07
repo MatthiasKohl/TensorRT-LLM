@@ -571,7 +571,7 @@ class MLA(nn.Module):
         # TODO: loading weights needs to be aware of cp as well and split v_b_proj accordingly
         self.v_b_proj = nn.Parameter(
             torch.empty(
-                (self.num_heads_tp, self.v_head_dim, self.kv_lora_rank),
+                (self.num_heads_tp_cp, self.v_head_dim, self.kv_lora_rank),
                 dtype=dtype,
             ),
             requires_grad=False,
@@ -781,7 +781,7 @@ class MLA(nn.Module):
 
     def create_output(self, hidden_states: torch.Tensor):
         num_tokens = hidden_states.shape[0]
-        hidden_size = self.o_proj.in_features // self.mapping.cp_size
+        hidden_size = self.o_proj.in_features
         return hidden_states.new_empty([num_tokens, hidden_size],
                                        dtype=hidden_states.dtype)
 
@@ -1204,18 +1204,25 @@ class MLA(nn.Module):
         latent_cache: Optional[torch.Tensor] = None,
         output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        output_ = None
         if isinstance(self.mha, TrtllmAttention):
             assert isinstance(attn_metadata, TrtllmAttentionMetadata)
             trtllm_attention = cast(TrtllmAttention, self.mha)
             if trtllm_attention.is_chunked_prefill_for_mla_context(
                     attn_metadata):
-                return self.forward_context_with_chunked_prefill(
+                output_ = self.forward_context_with_chunked_prefill(
                     q, compressed_kv, latent_cache, attn_metadata, output)
             elif trtllm_attention.has_cached_kv_for_mla_context(attn_metadata):
-                return self.forward_context_with_cached_kv(
+                output_ = self.forward_context_with_cached_kv(
                     q, latent_cache, attn_metadata, output)
-        return self.forward_context_default(q, compressed_kv, k_pe,
-                                            attn_metadata, latent_cache, output)
+        if output_ is None:
+            output_ = self.forward_context_default(q, compressed_kv, k_pe,
+                                                   attn_metadata, latent_cache,
+                                                   output)
+        # for Helix parallelism, we need to ensure that the output is compatible
+        # with o_proj, thus we cut it to num_heads_tp_cp * v_head_dim
+        # note: without CP/Helix, nothing changes
+        return output_[:, :self.num_heads_tp_cp * self.v_head_dim]
 
     def forward_generation(
             self,
@@ -1292,8 +1299,7 @@ class MLA(nn.Module):
 
         # [seq, num_heads, kv_lora_rank]
         attn_out_latent = attn_out_latent.view(
-            [-1, self.num_heads_tp_cp,
-             self.kv_lora_rank]).repeat(1, self.mapping.cp_size, 1)
+            [-1, self.num_heads_tp_cp, self.kv_lora_rank])
 
         # [seq, num_heads * v_head_dim]
         output = output if output is not None else torch.empty(
@@ -1318,7 +1324,7 @@ class MLA(nn.Module):
             raise NotImplementedError(
                 f"Missing bmm impl for dtype: {self.v_b_proj.dtype}.")
 
-        return output[:, :self.num_heads_tp_cp * self.v_head_dim]
+        return output
 
     def forward(
         self,

@@ -64,42 +64,44 @@ class Scenario:
     predicted_tokens_per_seq: int = 1
     bias: bool = False
     batch: int = 8
-    seq_len: int = 1024
+    ctx_len: int = 1024
+    # TODO: remove this attribute, and add gen_steps as a parameter for tests
+    # this will then be set differently for the reference test and actual benchmarking
     gen_steps: int = 256
     ref_steps: int = 4
 
     @property
     def max_position_embeddings(self) -> int:
         # ensure that max_position_embeddings is set large enough for every scenario
-        return self.seq_len + 1
+        return self.ctx_len + 1
 
 
 all_scenarios = [
-    Scenario(batch=1, seq_len=1024),
-    Scenario(batch=1, seq_len=2048),
-    Scenario(batch=1, seq_len=4096),
-    Scenario(batch=1, seq_len=8192),
-    Scenario(batch=1, seq_len=16384),
-    Scenario(batch=1, seq_len=32768),
-    Scenario(batch=1, seq_len=65536),
-    Scenario(batch=1, seq_len=131072),
-    Scenario(batch=8, seq_len=1024),
-    Scenario(batch=8, seq_len=2048),
-    Scenario(batch=8, seq_len=4096),
-    Scenario(batch=8, seq_len=8192),
-    Scenario(batch=8, seq_len=16384),
-    Scenario(batch=8, seq_len=32768),
-    Scenario(batch=8, seq_len=65536),
-    Scenario(batch=8, seq_len=131072),
-    Scenario(batch=16, seq_len=1024),
-    Scenario(batch=16, seq_len=2048),
-    Scenario(batch=16, seq_len=4096),
-    Scenario(batch=16, seq_len=8192),
-    Scenario(batch=16, seq_len=16384),
-    Scenario(batch=16, seq_len=32768),
-    Scenario(batch=16, seq_len=65536),
+    Scenario(batch=1, ctx_len=1024),
+    Scenario(batch=1, ctx_len=2048),
+    Scenario(batch=1, ctx_len=4096),
+    Scenario(batch=1, ctx_len=8192),
+    Scenario(batch=1, ctx_len=16384),
+    Scenario(batch=1, ctx_len=32768),
+    Scenario(batch=1, ctx_len=65536),
+    Scenario(batch=1, ctx_len=131072),
+    Scenario(batch=8, ctx_len=1024),
+    Scenario(batch=8, ctx_len=2048),
+    Scenario(batch=8, ctx_len=4096),
+    Scenario(batch=8, ctx_len=8192),
+    Scenario(batch=8, ctx_len=16384),
+    Scenario(batch=8, ctx_len=32768),
+    Scenario(batch=8, ctx_len=65536),
+    Scenario(batch=8, ctx_len=131072),
+    Scenario(batch=16, ctx_len=1024),
+    Scenario(batch=16, ctx_len=2048),
+    Scenario(batch=16, ctx_len=4096),
+    Scenario(batch=16, ctx_len=8192),
+    Scenario(batch=16, ctx_len=16384),
+    Scenario(batch=16, ctx_len=32768),
+    Scenario(batch=16, ctx_len=65536),
     # this goes OOM
-    # Scenario(batch=16, seq_len=131072),
+    # Scenario(batch=16, ctx_len=131072),
 ]
 
 # limit the number of test scenarios to avoid taking too long
@@ -136,10 +138,10 @@ class RopeConfig:
 def _setup_kv_and_metadata(scenario: Scenario, mapping: Mapping):
     # Set up KVCacheManager and attn_metadata for MLA
     n_gpu = mapping.world_size
-    assert scenario.seq_len % n_gpu == 0
-    seq_len_per_gpu = scenario.seq_len // n_gpu
+    assert scenario.ctx_len % n_gpu == 0
+    ctx_len_per_gpu = scenario.ctx_len // n_gpu
     max_tokens = (
-        seq_len_per_gpu + scenario.gen_steps +
+        ctx_len_per_gpu + scenario.gen_steps +
         scenario.kv_cache_tokens_per_block - 1
     ) // scenario.kv_cache_tokens_per_block * scenario.kv_cache_tokens_per_block * scenario.batch
     kv_cache_manager = KVCacheManager(
@@ -154,7 +156,7 @@ def _setup_kv_and_metadata(scenario: Scenario, mapping: Mapping):
         head_dim=scenario.kv_lora_rank + scenario.qk_rope_head_dim,
         tokens_per_block=scenario.
         kv_cache_tokens_per_block,  # for test, just use seq_len
-        max_seq_len=seq_len_per_gpu + scenario.gen_steps,
+        max_seq_len=ctx_len_per_gpu + scenario.gen_steps,
         max_batch_size=scenario.batch,
         mapping=mapping,
         dtype=str_dtype_to_binding(torch_dtype_to_str(scenario.kv_cache_dtype)),
@@ -164,7 +166,7 @@ def _setup_kv_and_metadata(scenario: Scenario, mapping: Mapping):
             request_id=req_id,
             max_new_tokens=1,
             input_tokens=[1] *
-            seq_len_per_gpu,  # all requests have the same length here
+            ctx_len_per_gpu,  # all requests have the same length here
             sampling_config=SamplingConfig(
                 SamplingParams()._get_sampling_config()),
             is_streaming=False,
@@ -172,19 +174,19 @@ def _setup_kv_and_metadata(scenario: Scenario, mapping: Mapping):
         req.is_dummy_request = True
         req.paged_kv_block_ids = []
         beam_width = 1
-        kv_cache_manager.impl.add_sequence(req_id, seq_len_per_gpu, beam_width,
+        kv_cache_manager.impl.add_sequence(req_id, ctx_len_per_gpu, beam_width,
                                            req)
         req.state = LlmRequestState.GENERATION_IN_PROGRESS
-        req.prompt_len = seq_len_per_gpu
+        req.prompt_len = ctx_len_per_gpu
         req.py_prompt_len = req.prompt_len
     attn_metadata = get_attention_backend("TRTLLM").Metadata(
-        seq_lens=torch.tensor([seq_len_per_gpu] * scenario.batch,
+        seq_lens=torch.tensor([ctx_len_per_gpu + 1] * scenario.batch,
                               dtype=torch.int),
         request_ids=list(range(scenario.batch)),
         max_num_requests=scenario.batch,
         num_contexts=scenario.batch,
-        prompt_lens=[seq_len_per_gpu] * scenario.batch,
-        max_num_tokens=seq_len_per_gpu,
+        prompt_lens=[ctx_len_per_gpu] * scenario.batch,
+        max_num_tokens=ctx_len_per_gpu,
         kv_cache_manager=kv_cache_manager,
         kv_cache_params=KVCacheParams(
             use_cache=True,
@@ -286,29 +288,29 @@ def _run_mla_distributed(rank: int, world_size: int, scenario: Scenario,
     # above should have the same config as the reference MLA except for the mapping
     # we update the weights accordingly and should be able to load them
     _copy_to_cp(weights, "o_proj.weight", 1, rank, world_size)
-    # _copy_to_cp(weights, "v_b_proj", 0, rank, world_size)
+    _copy_to_cp(weights, "v_b_proj", 0, rank, world_size)
     mla.load_state_dict(weights)
     # Set up KVCacheManager and attn_metadata for distributed
     kv_cache_manager, attn_metadata = _setup_kv_and_metadata(scenario, mapping)
     extra_attrs["attention_metadata"] = weakref.ref(attn_metadata)
-    seq_len_per_gpu = scenario.seq_len // world_size
-    input_ctx_bs = input_ctx.view(scenario.batch, scenario.seq_len,
+    ctx_len_per_gpu = scenario.ctx_len // world_size
+    input_ctx_bs = input_ctx.view(scenario.batch, scenario.ctx_len,
                                   scenario.hidden_size)
     input_gen = input_ctx_bs[:, 0, :].contiguous()
     position_ids_ctx_bs = position_ids_ctx.view(scenario.batch,
-                                                scenario.seq_len)
+                                                scenario.ctx_len)
     position_ids_gen = position_ids_ctx_bs[:, 0].contiguous()
 
     # split inputs into chunks for each rank
-    input_ctx_bs_rank = input_ctx_bs[:, rank * seq_len_per_gpu:(rank + 1) *
-                                     seq_len_per_gpu, :]
+    input_ctx_bs_rank = input_ctx_bs[:, rank * ctx_len_per_gpu:(rank + 1) *
+                                     ctx_len_per_gpu, :]
     input_ctx_rank = input_ctx_bs_rank.reshape(
-        scenario.batch * seq_len_per_gpu, scenario.hidden_size).contiguous()
+        scenario.batch * ctx_len_per_gpu, scenario.hidden_size).contiguous()
     position_ids_ctx_bs_rank = position_ids_ctx_bs[:, rank *
-                                                   seq_len_per_gpu:(rank + 1) *
-                                                   seq_len_per_gpu]
+                                                   ctx_len_per_gpu:(rank + 1) *
+                                                   ctx_len_per_gpu]
     position_ids_ctx_rank = position_ids_ctx_bs_rank.reshape(
-        scenario.batch * seq_len_per_gpu).contiguous()
+        scenario.batch * ctx_len_per_gpu).contiguous()
     # this represents the context step
     with model_extra_attrs(extra_attrs):
         mla(position_ids_ctx_rank, input_ctx_rank, attn_metadata)
@@ -321,13 +323,13 @@ def _run_mla_distributed(rank: int, world_size: int, scenario: Scenario,
             request_ids=list(range(scenario.batch)),
             max_num_requests=scenario.batch,
             num_contexts=0,
-            prompt_lens=[seq_len_per_gpu] * scenario.batch,
-            max_num_tokens=seq_len_per_gpu,
+            prompt_lens=[ctx_len_per_gpu] * scenario.batch,
+            max_num_tokens=ctx_len_per_gpu,
             kv_cache_manager=kv_cache_manager,
             kv_cache_params=KVCacheParams(
                 use_cache=True,
                 num_cached_tokens_per_seq=[
-                    seq_len_per_gpu + step for _ in range(scenario.batch)
+                    ctx_len_per_gpu + step for _ in range(scenario.batch)
                 ],
             ),
             enable_paged_context_mla=True,
@@ -377,11 +379,11 @@ def _full_test_multi_gpu(rank: int, world_size: int, scenario: Scenario):
         qk_rope_head_dim=scenario.qk_rope_head_dim,
         model_type=scenario.model_type)
     torch.manual_seed(42)
-    input_ctx = torch.empty(scenario.batch * scenario.seq_len,
+    input_ctx = torch.empty(scenario.batch * scenario.ctx_len,
                             scenario.hidden_size,
                             dtype=scenario.dtype,
                             device="cuda").uniform_(-1, 1)
-    position_ids_ctx = torch.arange(scenario.seq_len,
+    position_ids_ctx = torch.arange(scenario.ctx_len,
                                     device="cuda").repeat(scenario.batch)
 
     pos_embd_params = PositionalEmbeddingParams(
@@ -411,10 +413,10 @@ def _full_test_multi_gpu(rank: int, world_size: int, scenario: Scenario):
     # up to this point, all ranks should have same tensors because the seed is the same
     # now we run the reference MLA on rank 0
     if rank == 0:
-        input_gen = input_ctx.view(scenario.batch, scenario.seq_len,
+        input_gen = input_ctx.view(scenario.batch, scenario.ctx_len,
                                    scenario.hidden_size)[:, 0, :].contiguous()
         position_ids_gen = position_ids_ctx.view(
-            scenario.batch, scenario.seq_len)[:, 0].contiguous()
+            scenario.batch, scenario.ctx_len)[:, 0].contiguous()
         # Reference output (single GPU, but with correct KV/metadata setup)
         ref_mapping = Mapping(world_size=1, tp_size=1, rank=0)
         ref_kv_cache_manager, ref_attn_metadata = _setup_kv_and_metadata(
@@ -430,13 +432,13 @@ def _full_test_multi_gpu(rank: int, world_size: int, scenario: Scenario):
                 request_ids=list(range(scenario.batch)),
                 max_num_requests=scenario.batch,
                 num_contexts=0,
-                prompt_lens=[scenario.seq_len] * scenario.batch,
-                max_num_tokens=scenario.seq_len,
+                prompt_lens=[scenario.ctx_len] * scenario.batch,
+                max_num_tokens=scenario.ctx_len,
                 kv_cache_manager=ref_kv_cache_manager,
                 kv_cache_params=KVCacheParams(
                     use_cache=True,
                     num_cached_tokens_per_seq=[
-                        scenario.seq_len + step for _ in range(scenario.batch)
+                        scenario.ctx_len + step for _ in range(scenario.batch)
                     ],
                 ),
                 enable_paged_context_mla=True,
