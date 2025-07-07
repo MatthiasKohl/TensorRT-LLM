@@ -571,7 +571,7 @@ class MLA(nn.Module):
         # TODO: loading weights needs to be aware of cp as well and split v_b_proj accordingly
         self.v_b_proj = nn.Parameter(
             torch.empty(
-                (self.num_heads_tp_cp, self.v_head_dim, self.kv_lora_rank),
+                (self.num_heads_tp, self.v_head_dim, self.kv_lora_rank),
                 dtype=dtype,
             ),
             requires_grad=False,
@@ -593,7 +593,7 @@ class MLA(nn.Module):
             self.hidden_size,
             bias=self.dense_bias,
             dtype=dtype,
-            mapping=mapping,
+            mapping=mapping_o,
             tensor_parallel_mode=TensorParallelMode.ROW,
             quant_config=quant_config,
             skip_create_weights_in_init=config.skip_create_weights_in_init,
@@ -1292,16 +1292,17 @@ class MLA(nn.Module):
 
         # [seq, num_heads, kv_lora_rank]
         attn_out_latent = attn_out_latent.view(
-            [-1, self.num_heads_tp_cp, self.kv_lora_rank])
+            [-1, self.num_heads_tp_cp,
+             self.kv_lora_rank]).repeat(1, self.mapping.cp_size, 1)
 
         # [seq, num_heads * v_head_dim]
         output = output if output is not None else torch.empty(
-            [num_tokens, self.num_heads_tp_cp * self.v_head_dim],
+            [num_tokens, self.num_heads_tp * self.v_head_dim],
             dtype=attn_out_latent.dtype,
             device=attn_out_latent.device)
 
         attn_output = output.view(
-            [num_tokens, self.num_heads_tp_cp, self.v_head_dim])
+            [num_tokens, self.num_heads_tp, self.v_head_dim])
 
         if self.v_b_proj.dtype == torch.bfloat16:
             # [num_heads, seq, kv_lora_rank] x [num_heads, kv_lora_rank, v_head_dim]
@@ -1317,7 +1318,7 @@ class MLA(nn.Module):
             raise NotImplementedError(
                 f"Missing bmm impl for dtype: {self.v_b_proj.dtype}.")
 
-        return output
+        return output[:, :self.num_heads_tp_cp * self.v_head_dim]
 
     def forward(
         self,
@@ -1337,7 +1338,6 @@ class MLA(nn.Module):
                               hidden_states,
                               attn_metadata,
                               output=attn_output)
-        attn_output = self.o_proj(attn_output.repeat(
-            1, self.mapping.cp_size).contiguous(),
+        attn_output = self.o_proj(attn_output,
                                   all_reduce_params=all_reduce_params)
         return attn_output

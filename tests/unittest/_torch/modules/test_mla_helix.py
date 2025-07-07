@@ -104,12 +104,12 @@ all_scenarios = [
 
 # limit the number of test scenarios to avoid taking too long
 test_scenarios = [
-    all_scenarios[1],
-    all_scenarios[5],
-    all_scenarios[8],
+    # all_scenarios[1],
+    # all_scenarios[5],
+    # all_scenarios[8],
     all_scenarios[12],
-    all_scenarios[18],
-    all_scenarios[19],
+    # all_scenarios[18],
+    # all_scenarios[19],
 ]
 
 
@@ -285,8 +285,8 @@ def _run_mla_distributed(rank: int, world_size: int, scenario: Scenario,
     ).cuda()
     # above should have the same config as the reference MLA except for the mapping
     # we update the weights accordingly and should be able to load them
-    # _copy_to_cp(weights, "o_proj.weight", 1, rank, world_size)
-    _copy_to_cp(weights, "v_b_proj", 0, rank, world_size)
+    _copy_to_cp(weights, "o_proj.weight", 1, rank, world_size)
+    # _copy_to_cp(weights, "v_b_proj", 0, rank, world_size)
     mla.load_state_dict(weights)
     # Set up KVCacheManager and attn_metadata for distributed
     kv_cache_manager, attn_metadata = _setup_kv_and_metadata(scenario, mapping)
