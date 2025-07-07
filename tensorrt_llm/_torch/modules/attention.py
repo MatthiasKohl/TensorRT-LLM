@@ -586,8 +586,6 @@ class MLA(nn.Module):
             gpus_per_node=self.mapping.gpus_per_node,
             enable_attention_dp=self.mapping.enable_attention_dp,
         )
-        # TODO need to debug this: it looks like we're getting an illegal memory access when
-        # using tp + cp parallelism here, but need to further debug.
         self.o_proj = Linear(
             self.num_heads_tp_cp * self.v_head_dim * tp_size * cp_size,
             self.hidden_size,
@@ -779,9 +777,14 @@ class MLA(nn.Module):
         else:
             return attn_instance.forward(q, k, v, attn_metadata, **kwargs)
 
-    def create_output(self, hidden_states: torch.Tensor):
+    def create_output(self, hidden_states: torch.Tensor, num_contexts: int):
         num_tokens = hidden_states.shape[0]
+        # note: for testing Helix parallelism, we ensure that the output is
+        # large enough for the context phase, but we then cut it again in
+        # `forward_context`
         hidden_size = self.o_proj.in_features
+        if num_contexts > 0:
+            hidden_size *= self.mapping.cp_size
         return hidden_states.new_empty([num_tokens, hidden_size],
                                        dtype=hidden_states.dtype)
 
@@ -1204,25 +1207,18 @@ class MLA(nn.Module):
         latent_cache: Optional[torch.Tensor] = None,
         output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        output_ = None
         if isinstance(self.mha, TrtllmAttention):
             assert isinstance(attn_metadata, TrtllmAttentionMetadata)
             trtllm_attention = cast(TrtllmAttention, self.mha)
             if trtllm_attention.is_chunked_prefill_for_mla_context(
                     attn_metadata):
-                output_ = self.forward_context_with_chunked_prefill(
+                return self.forward_context_with_chunked_prefill(
                     q, compressed_kv, latent_cache, attn_metadata, output)
             elif trtllm_attention.has_cached_kv_for_mla_context(attn_metadata):
-                output_ = self.forward_context_with_cached_kv(
+                return self.forward_context_with_cached_kv(
                     q, latent_cache, attn_metadata, output)
-        if output_ is None:
-            output_ = self.forward_context_default(q, compressed_kv, k_pe,
-                                                   attn_metadata, latent_cache,
-                                                   output)
-        # for Helix parallelism, we need to ensure that the output is compatible
-        # with o_proj, thus we cut it to num_heads_tp_cp * v_head_dim
-        # note: without CP/Helix, nothing changes
-        return output_[:, :self.num_heads_tp_cp * self.v_head_dim]
+        return self.forward_context_default(q, compressed_kv, k_pe,
+                                            attn_metadata, latent_cache, output)
 
     def forward_generation(
             self,
@@ -1303,12 +1299,12 @@ class MLA(nn.Module):
 
         # [seq, num_heads * v_head_dim]
         output = output if output is not None else torch.empty(
-            [num_tokens, self.num_heads_tp * self.v_head_dim],
+            [num_tokens, self.num_heads_tp_cp * self.v_head_dim],
             dtype=attn_out_latent.dtype,
             device=attn_out_latent.device)
 
         attn_output = output.view(
-            [num_tokens, self.num_heads_tp, self.v_head_dim])
+            [num_tokens, self.num_heads_tp_cp, self.v_head_dim])
 
         if self.v_b_proj.dtype == torch.bfloat16:
             # [num_heads, seq, kv_lora_rank] x [num_heads, kv_lora_rank, v_head_dim]
@@ -1334,7 +1330,8 @@ class MLA(nn.Module):
         all_reduce_params: Optional[AllReduceParams] = None,
     ) -> torch.Tensor:
 
-        attn_output = self.create_output(hidden_states)
+        attn_output = self.create_output(hidden_states,
+                                         attn_metadata.num_contexts)
         if self.register_to_config:
             torch.ops.trtllm.mla_custom_op_inplace(hidden_states, position_ids,
                                                    self.layer_idx_str,
@@ -1344,6 +1341,9 @@ class MLA(nn.Module):
                               hidden_states,
                               attn_metadata,
                               output=attn_output)
+        # note: for testing Helix parallelism, we ensure that the output is
+        # compatible with o_proj, thus we cut it to num_heads_tp_cp * v_head_dim
+        attn_output = attn_output[:, :self.num_heads_tp_cp * self.v_head_dim]
         attn_output = self.o_proj(attn_output,
                                   all_reduce_params=all_reduce_params)
         return attn_output

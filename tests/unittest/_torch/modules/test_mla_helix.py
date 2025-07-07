@@ -65,9 +65,6 @@ class Scenario:
     bias: bool = False
     batch: int = 8
     ctx_len: int = 1024
-    # TODO: remove this attribute, and add gen_steps as a parameter for tests
-    # this will then be set differently for the reference test and actual benchmarking
-    gen_steps: int = 256
     ref_steps: int = 4
 
     @property
@@ -135,14 +132,14 @@ class RopeConfig:
     model_type: str = "deepseek_v3"
 
 
-def _setup_kv_and_metadata(scenario: Scenario, mapping: Mapping):
+def _setup_kv_and_metadata(scenario: Scenario, mapping: Mapping,
+                           gen_steps: int):
     # Set up KVCacheManager and attn_metadata for MLA
     n_gpu = mapping.world_size
     assert scenario.ctx_len % n_gpu == 0
     ctx_len_per_gpu = scenario.ctx_len // n_gpu
     max_tokens = (
-        ctx_len_per_gpu + scenario.gen_steps +
-        scenario.kv_cache_tokens_per_block - 1
+        ctx_len_per_gpu + gen_steps + scenario.kv_cache_tokens_per_block - 1
     ) // scenario.kv_cache_tokens_per_block * scenario.kv_cache_tokens_per_block * scenario.batch
     kv_cache_manager = KVCacheManager(
         KvCacheConfig(
@@ -156,7 +153,7 @@ def _setup_kv_and_metadata(scenario: Scenario, mapping: Mapping):
         head_dim=scenario.kv_lora_rank + scenario.qk_rope_head_dim,
         tokens_per_block=scenario.
         kv_cache_tokens_per_block,  # for test, just use seq_len
-        max_seq_len=ctx_len_per_gpu + scenario.gen_steps,
+        max_seq_len=ctx_len_per_gpu + gen_steps,
         max_batch_size=scenario.batch,
         mapping=mapping,
         dtype=str_dtype_to_binding(torch_dtype_to_str(scenario.kv_cache_dtype)),
@@ -180,7 +177,7 @@ def _setup_kv_and_metadata(scenario: Scenario, mapping: Mapping):
         req.prompt_len = ctx_len_per_gpu
         req.py_prompt_len = req.prompt_len
     attn_metadata = get_attention_backend("TRTLLM").Metadata(
-        seq_lens=torch.tensor([ctx_len_per_gpu + 1] * scenario.batch,
+        seq_lens=torch.tensor([ctx_len_per_gpu] * scenario.batch,
                               dtype=torch.int),
         request_ids=list(range(scenario.batch)),
         max_num_requests=scenario.batch,
@@ -263,7 +260,7 @@ def _copy_to_cp(weights, param_name, dim, rank, world_size):
 
 def _run_mla_distributed(rank: int, world_size: int, scenario: Scenario,
                          mapping: Mapping, test_params: tuple,
-                         ref_output: torch.Tensor):
+                         ref_output: torch.Tensor, gen_steps: int):
     input_ctx, position_ids_ctx, weights, pos_embd_params = test_params
     extra_attrs = dict()
     config = ModelConfig(mapping=mapping)
@@ -291,7 +288,8 @@ def _run_mla_distributed(rank: int, world_size: int, scenario: Scenario,
     _copy_to_cp(weights, "v_b_proj", 0, rank, world_size)
     mla.load_state_dict(weights)
     # Set up KVCacheManager and attn_metadata for distributed
-    kv_cache_manager, attn_metadata = _setup_kv_and_metadata(scenario, mapping)
+    kv_cache_manager, attn_metadata = _setup_kv_and_metadata(
+        scenario, mapping, gen_steps)
     extra_attrs["attention_metadata"] = weakref.ref(attn_metadata)
     ctx_len_per_gpu = scenario.ctx_len // world_size
     input_ctx_bs = input_ctx.view(scenario.batch, scenario.ctx_len,
@@ -315,7 +313,7 @@ def _run_mla_distributed(rank: int, world_size: int, scenario: Scenario,
     with model_extra_attrs(extra_attrs):
         mla(position_ids_ctx_rank, input_ctx_rank, attn_metadata)
     outputs = []
-    for step in range(scenario.gen_steps):
+    for step in range(gen_steps):
         for req_id in range(scenario.batch):
             kv_cache_manager.impl.add_token(req_id)
         attn_metadata = get_attention_backend("TRTLLM").Metadata(
@@ -343,10 +341,10 @@ def _run_mla_distributed(rank: int, world_size: int, scenario: Scenario,
         elif step == scenario.ref_steps:
             start = time.time()
     end = time.time()
-    avg_gen_time = (end - start) / (scenario.gen_steps - scenario.ref_steps)
+    avg_gen_time = (end - start) / (gen_steps - scenario.ref_steps)
     throughput = scenario.batch / avg_gen_time
     print(f"Rank {rank} {world_size}-GPU: time taken for "
-          f"{scenario.gen_steps - scenario.ref_steps} steps: "
+          f"{gen_steps - scenario.ref_steps} steps: "
           f"{end - start} s, throughput: {throughput} MLA/s")
     output = torch.stack(outputs, dim=0)
     kv_cache_manager.shutdown()
@@ -356,7 +354,8 @@ def _run_mla_distributed(rank: int, world_size: int, scenario: Scenario,
 
 
 @torch.inference_mode
-def _full_test_multi_gpu(rank: int, world_size: int, scenario: Scenario):
+def _full_test_multi_gpu(rank: int, world_size: int, scenario: Scenario,
+                         gen_steps: int):
     if scenario.rope_scaling:
         rope_scaling = {
             "beta_fast": scenario.rope_beta_fast,
@@ -420,11 +419,11 @@ def _full_test_multi_gpu(rank: int, world_size: int, scenario: Scenario):
         # Reference output (single GPU, but with correct KV/metadata setup)
         ref_mapping = Mapping(world_size=1, tp_size=1, rank=0)
         ref_kv_cache_manager, ref_attn_metadata = _setup_kv_and_metadata(
-            scenario, ref_mapping)
+            scenario, ref_mapping, gen_steps)
         # this represents the context step
         mla(position_ids_ctx, input_ctx, ref_attn_metadata)
         ref_outputs = []
-        for step in range(scenario.gen_steps):
+        for step in range(gen_steps):
             for req_id in range(scenario.batch):
                 ref_kv_cache_manager.impl.add_token(req_id)
             ref_attn_metadata = get_attention_backend("TRTLLM").Metadata(
@@ -450,11 +449,10 @@ def _full_test_multi_gpu(rank: int, world_size: int, scenario: Scenario):
             elif step == scenario.ref_steps:
                 start = time.time()
         end = time.time()
-        avg_gen_time = (end - start) / (scenario.gen_steps - scenario.ref_steps)
+        avg_gen_time = (end - start) / (gen_steps - scenario.ref_steps)
         throughput = scenario.batch / avg_gen_time
-        print(
-            f"Time taken for {scenario.gen_steps - scenario.ref_steps} steps: "
-            f"{end - start} s, throughput: {throughput} MLA/s")
+        print(f"Time taken for {gen_steps - scenario.ref_steps} steps: "
+              f"{end - start} s, throughput: {throughput} MLA/s")
         ref_output = torch.stack(ref_outputs, dim=0)
         ref_kv_cache_manager.shutdown()
     else:
@@ -476,7 +474,7 @@ def _full_test_multi_gpu(rank: int, world_size: int, scenario: Scenario):
     ref_output = ref_output_all.view(world_size, *ref_output.shape)[0]
     test_params = (input_ctx, position_ids_ctx, weights, pos_embd_params)
     _run_mla_distributed(rank, world_size, scenario, mapping, test_params,
-                         ref_output)
+                         ref_output, gen_steps)
 
 
 def _run_single_rank(func, *args, **kwargs):
@@ -501,14 +499,18 @@ def _run_single_rank(func, *args, **kwargs):
 def test_mla_helix_distributed(scenario: Scenario):
     world_size = 2
     with MPIPoolExecutor(max_workers=world_size) as executor:
+        gen_steps = scenario.ref_steps
         results = executor.map(
             _run_single_rank,
-            *zip(*[(_full_test_multi_gpu, world_size, scenario)] * world_size))
+            *zip(*[(_full_test_multi_gpu, world_size, scenario, gen_steps)] *
+                 world_size))
         for r in results:
             assert r is None
 
 
 if __name__ == "__main__":
     for scenario in all_scenarios:
-        print(f"Running scenario: {scenario}")
+        timing_steps = 256
+        gen_steps = scenario.ref_steps + timing_steps
+        print(f"Running scenario: {scenario} and timing {timing_steps} steps")
         test_mla_helix_distributed(scenario)
