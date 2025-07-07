@@ -200,18 +200,18 @@ def _generate_random_weights(mla: MLA):
     # TODO need to debug numerically when using non-zero values
     def init_uniform(tensor, a=-1.0, b=1.0):
         if tensor is not None:
-            # nn.init.uniform_(tensor, a=a, b=b)
-            tensor.fill_(0.0)
+            nn.init.uniform_(tensor, a=a, b=b)
+            # tensor.fill_(0.0)
 
     def init_block_scale(tensor, orig_tensor):
         if tensor is None or orig_tensor is None:
             return
-        tensor.fill_(0.0)
-        # x = orig_tensor.view(*orig_tensor.shape[:-2],
-        #                      orig_tensor.shape[-2] // 128, 128,
-        #                      orig_tensor.shape[-1] // 128, 128)
-        # scale = x.abs().amax(dim=(-3, -1)) / 448.
-        # tensor.fill_(scale)
+        # tensor.fill_(0.0)
+        x = orig_tensor.view(*orig_tensor.shape[:-2],
+                             orig_tensor.shape[-2] // 128, 128,
+                             orig_tensor.shape[-1] // 128, 128)
+        scale = x.abs().amax(dim=(-3, -1)) / 448.
+        tensor.fill_(scale)
 
     # Linear modules
     for name in ["fused_a", "kv_b_proj", "o_proj"]:
@@ -313,6 +313,7 @@ def _run_mla_distributed(rank: int, world_size: int, scenario: Scenario,
     with model_extra_attrs(extra_attrs):
         mla(position_ids_ctx_rank, input_ctx_rank, attn_metadata)
     outputs = []
+    start = time.time()
     for step in range(gen_steps):
         for req_id in range(scenario.batch):
             kv_cache_manager.impl.add_token(req_id)
@@ -341,7 +342,10 @@ def _run_mla_distributed(rank: int, world_size: int, scenario: Scenario,
         elif step == scenario.ref_steps:
             start = time.time()
     end = time.time()
-    avg_gen_time = (end - start) / (gen_steps - scenario.ref_steps)
+    if gen_steps == scenario.ref_steps:
+        avg_gen_time = float('inf')
+    else:
+        avg_gen_time = (end - start) / (gen_steps - scenario.ref_steps)
     throughput = scenario.batch / avg_gen_time
     print(f"Rank {rank} {world_size}-GPU: time taken for "
           f"{gen_steps - scenario.ref_steps} steps: "
@@ -423,6 +427,7 @@ def _full_test_multi_gpu(rank: int, world_size: int, scenario: Scenario,
         # this represents the context step
         mla(position_ids_ctx, input_ctx, ref_attn_metadata)
         ref_outputs = []
+        start = time.time()
         for step in range(gen_steps):
             for req_id in range(scenario.batch):
                 ref_kv_cache_manager.impl.add_token(req_id)
@@ -449,7 +454,10 @@ def _full_test_multi_gpu(rank: int, world_size: int, scenario: Scenario,
             elif step == scenario.ref_steps:
                 start = time.time()
         end = time.time()
-        avg_gen_time = (end - start) / (gen_steps - scenario.ref_steps)
+        if gen_steps == scenario.ref_steps:
+            avg_gen_time = float('inf')
+        else:
+            avg_gen_time = (end - start) / (gen_steps - scenario.ref_steps)
         throughput = scenario.batch / avg_gen_time
         print(f"Time taken for {gen_steps - scenario.ref_steps} steps: "
               f"{end - start} s, throughput: {throughput} MLA/s")
@@ -509,7 +517,7 @@ def test_mla_helix_distributed(scenario: Scenario):
 
 
 if __name__ == "__main__":
-    for scenario in all_scenarios:
+    for scenario in test_scenarios:
         timing_steps = 256
         gen_steps = scenario.ref_steps + timing_steps
         print(f"Running scenario: {scenario} and timing {timing_steps} steps")
