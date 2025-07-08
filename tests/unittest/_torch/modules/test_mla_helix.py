@@ -202,6 +202,11 @@ def _generate_random_weights(mla: MLA):
         if tensor is not None:
             torch.nn.init.uniform_(tensor, a=a, b=b)
             # tensor.fill_(0.0)
+    def init_noproj(tensor):
+        if tensor is not None:
+            tensor.zero_()
+            tensor[:, 0] = 1.0
+            # tensor.fill_(0.0)
 
     def init_block_scale(tensor, orig_tensor):
         if tensor is None or orig_tensor is None:
@@ -234,13 +239,15 @@ def _generate_random_weights(mla: MLA):
     for name in ["q_b_proj", "q_proj"]:
         mod = getattr(mla, name, None)
         if mod is not None:
-            init_uniform(mod.weight)
+            init_noproj(mod.weight)
             if hasattr(mod, "bias"):
                 init_uniform(mod.bias)
 
     # k_b_proj_trans (created in create_weights)
     if hasattr(mla, "k_b_proj_trans"):
-        init_uniform(mla.k_b_proj_trans)
+        # init_uniform(mla.k_b_proj_trans)
+        mla.k_b_proj_trans.zero_()
+        mla.k_b_proj_trans[:, :, 0] = 1.0
     # k_b_proj_trans_scale (optional)
     if hasattr(mla, "k_b_proj_trans_scale"):
         init_block_scale(mla.k_b_proj_trans_scale, mla.k_b_proj_trans)
@@ -386,6 +393,9 @@ def _full_test_multi_gpu(rank: int, world_size: int, scenario: Scenario,
                             scenario.hidden_size,
                             dtype=scenario.dtype,
                             device="cuda").uniform_(-1, 1)
+    input_ctx.zero_()
+    input_ctx.view(scenario.batch, scenario.ctx_len,
+                   scenario.hidden_size)[:, :, 0] = 1.0
     position_ids_ctx = torch.arange(scenario.ctx_len,
                                     device="cuda").repeat(scenario.batch)
 
