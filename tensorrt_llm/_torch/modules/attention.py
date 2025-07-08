@@ -15,7 +15,7 @@ from ..attention_backend.interface import (AttentionBackend,
                                            PositionalEmbeddingParams,
                                            PredefinedAttentionMask)
 from ..attention_backend.utils import create_attention, get_attention_backend
-from ..distributed import AllReduceParams, alltoall
+from ..distributed import AllReduceParams, cp_allgather
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
 from ..utils import Fp4QuantizedTensor, get_model_extra_attrs
@@ -751,12 +751,21 @@ class MLA(nn.Module):
             # note: if num_heads_tp is a multiple of cp_size, we split this correctly here
             # gathered_o: [cp_size, num_tokens, num_heads_tp_cp * kv_lora_rank]
             # gathered_stats: [cp_size, num_tokens, num_heads_tp_cp, 2]
-            gathered_o, gathered_stats = alltoall(
-                [partial_o, softmax_stats],
-                self.mapping.cp_group,
-                dims=[-1, 1],
-                new_dims=[0, 0],
-            )
+            # gathered_o, gathered_stats = alltoall(
+            #     [partial_o, softmax_stats],
+            #     self.mapping.cp_group,
+            #     dims=[-1, 1],
+            #     new_dims=[0, 0],
+            # )
+            all_gathered = cp_allgather([partial_o, softmax_stats],
+                                        self.mapping,
+                                        dim=0)
+            # [num_tokens, num_heads * v_head_dim] -> [cp_size, num_tokens, num_heads * v_head_dim]
+            gathered_o = all_gathered[0].view(self.mapping.cp_size,
+                                              *partial_o.shape)
+            # [num_tokens, num_heads, 2] -> [cp_size, num_tokens, num_heads, 2]
+            gathered_stats = all_gathered[1].view(self.mapping.cp_size,
+                                                  *softmax_stats.shape)
             # [cp_size, num_tokens, num_heads_tp_cp] -> [1, num_tokens, num_heads_tp_cp]
             global_max = torch.max(gathered_stats[..., 0], dim=0,
                                    keepdim=True)[0]
@@ -773,7 +782,10 @@ class MLA(nn.Module):
                                           kv_lora_rank) * correction
             # [cp_size, num_tokens, num_heads_tp_cp, kv_lora_rank] -> [num_tokens, num_heads_tp_cp * kv_lora_rank]
             attn_output = torch.sum(corrected_o.view(*gathered_o.shape), dim=0)
-            return attn_output.to(dtype=gathered_o.dtype)
+            print(f"attn_output allgather: {attn_output[0, :4]}")
+            r_start = self.mapping.cp_rank * self.num_heads_tp_cp * self.v_head_dim
+            r_end = r_start + self.num_heads_tp_cp * self.v_head_dim
+            return attn_output[:, r_start:r_end].to(dtype=gathered_o.dtype)
         else:
             return attn_instance.forward(q, k, v, attn_metadata, **kwargs)
 
@@ -1353,6 +1365,6 @@ class MLA(nn.Module):
         attn_output = self.o_proj(attn_output,
                                   all_reduce_params=all_reduce_params)
         print(
-            f"attn_output: {attn_output[0, :4]} o_proj: {self.o_proj.weight[:4, :4]}"
+            f"attn_output_final: {attn_output[0, :4]} o_proj: {self.o_proj.weight[:4, :4]}"
         )
         return attn_output
