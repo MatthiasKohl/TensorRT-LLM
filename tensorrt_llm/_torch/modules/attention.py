@@ -745,6 +745,9 @@ class MLA(nn.Module):
                 attn_metadata,
                 softmax_stats_tensor=softmax_stats,
                 **kwargs)
+            print(
+                f"q.shape: {q.shape}, q: {q[0, :4]}, partial_o: {partial_o.shape}, {partial_o[0, :4]}, softmax_stats: {softmax_stats[0, :4, :]}"
+            )
             # this is the post-processing of helix parallel attention,
             # similar to the post-processing of ring attention
             kv_lora_rank = partial_o.shape[-1] // self.num_heads_tp
@@ -777,17 +780,35 @@ class MLA(nn.Module):
             global_sum = torch.sum(corrected_sum, dim=0, keepdim=True)
             # [cp_size, num_tokens, num_heads_tp_cp] -> [cp_size, num_tokens, num_heads_tp_cp, 1]
             correction = torch.unsqueeze(corrected_max_exp / global_sum, -1)
+            print(
+                f"global_max: {global_max[0, :4]}, global_sum: {global_sum[0, :4]}, corrected_max_exp: {corrected_max_exp[:, 0, :4]}, correction: {correction[:, 0, :4, 0]}"
+            )
             # [cp_size, num_tokens, num_heads_tp_cp, kv_lora_rank]
             corrected_o = gathered_o.view(*correction.shape[:-1],
                                           kv_lora_rank) * correction
             # [cp_size, num_tokens, num_heads_tp_cp, kv_lora_rank] -> [num_tokens, num_heads_tp_cp * kv_lora_rank]
             attn_output = torch.sum(corrected_o.view(*gathered_o.shape), dim=0)
             print(f"attn_output allgather: {attn_output[0, :4]}")
-            r_start = self.mapping.cp_rank * self.num_heads_tp_cp * self.v_head_dim
-            r_end = r_start + self.num_heads_tp_cp * self.v_head_dim
+            r_start = self.mapping.cp_rank * self.num_heads_tp_cp * self.kv_lora_rank
+            r_end = r_start + self.num_heads_tp_cp * self.kv_lora_rank
             return attn_output[:, r_start:r_end].to(dtype=gathered_o.dtype)
         else:
-            return attn_instance.forward(q, k, v, attn_metadata, **kwargs)
+            softmax_stats = torch.empty(q.shape[0],
+                                        self.num_heads_tp,
+                                        2,
+                                        device=q.device,
+                                        dtype=torch.float32)
+            attn_output = attn_instance.forward(
+                q,
+                k,
+                v,
+                attn_metadata,
+                softmax_stats_tensor=softmax_stats,
+                **kwargs)
+            print(
+                f"q shape: {q.shape}, q: {q[0, :4]}, mqa output: {attn_output.shape}, {attn_output[0, :4]}, softmax_stats: {softmax_stats[0, :4, :]}"
+            )
+            return attn_output
 
     def create_output(self, hidden_states: torch.Tensor, num_contexts: int):
         num_tokens = hidden_states.shape[0]
@@ -1283,7 +1304,9 @@ class MLA(nn.Module):
 
         if self.apply_rotary_emb:
             fused_q[..., self.kv_lora_rank:] = q_pe
-        print(f"fused_q: {fused_q[0, 0, :4]}")
+        print(
+            f"fused_q: {fused_q[0, 0, :4]}, latent_cache: {latent_cache[0, :4]}"
+        )
         fused_q = fused_q.view([
             num_tokens,
             self.num_heads_tp * (self.kv_lora_rank + self.qk_rope_head_dim)
