@@ -200,7 +200,7 @@ def _generate_random_weights(mla: MLA):
     # TODO need to debug numerically when using non-zero values
     def init_uniform(tensor, a=-1.0, b=1.0):
         if tensor is not None:
-            nn.init.uniform_(tensor, a=a, b=b)
+            torch.nn.init.uniform_(tensor, a=a, b=b)
             # tensor.fill_(0.0)
 
     def init_block_scale(tensor, orig_tensor):

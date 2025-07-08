@@ -1231,6 +1231,7 @@ class MLA(nn.Module):
         num_tokens = q.shape[0]
         q_nope, q_pe = q.view([-1, self.num_heads_tp, self.qk_head_dim]).split(
             [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        print(f"q_nope: {q_nope[0, 0, :4]}, q_pe: {q_pe[0, 0, :4]}")
 
         # fused_q contains 1) the result of the following bmm with shape [num_tokens, num_heads, kv_lora_rank]
         # 2) rope(q_pe) with shape [num_tokens, num_heads, qk_rope_head_dim]. rope is applied inside AttentionOp
@@ -1255,6 +1256,9 @@ class MLA(nn.Module):
             torch.ops.trtllm.bmm_out(q_nope_t,
                                      self.k_b_proj_trans.transpose(1, 2),
                                      q_nope_out)
+            print(
+                f"k_b_proj_trans {self.k_b_proj_trans[0, 0, :4]} q_nope_out: {q_nope_out[0, 0, :4]}"
+            )
         elif self.k_b_proj_trans.dtype == torch.float8_e4m3fn:
             # [num_heads, num_tokens, self.kv_lora_rank]
             q_nope_out = fused_q[..., :self.kv_lora_rank].transpose(0, 1)
@@ -1267,6 +1271,7 @@ class MLA(nn.Module):
 
         if self.apply_rotary_emb:
             fused_q[..., self.kv_lora_rank:] = q_pe
+        print(f"fused_q: {fused_q[0, 0, :4]}")
         fused_q = fused_q.view([
             num_tokens,
             self.num_heads_tp * (self.kv_lora_rank + self.qk_rope_head_dim)
@@ -1296,6 +1301,7 @@ class MLA(nn.Module):
         # [seq, num_heads, kv_lora_rank]
         attn_out_latent = attn_out_latent.view(
             [-1, self.num_heads_tp_cp, self.kv_lora_rank])
+        print(f"attn_out_latent: {attn_out_latent[0, 0, :4]}")
 
         # [seq, num_heads * v_head_dim]
         output = output if output is not None else torch.empty(
@@ -1319,7 +1325,7 @@ class MLA(nn.Module):
         else:
             raise NotImplementedError(
                 f"Missing bmm impl for dtype: {self.v_b_proj.dtype}.")
-
+        print(f"attn_output: {attn_output[0, 0, :4]}")
         return output
 
     def forward(
@@ -1346,4 +1352,7 @@ class MLA(nn.Module):
         attn_output = attn_output[:, :self.num_heads_tp_cp * self.v_head_dim]
         attn_output = self.o_proj(attn_output,
                                   all_reduce_params=all_reduce_params)
+        print(
+            f"attn_output: {attn_output[0, :4]} o_proj: {self.o_proj.weight[:4, :4]}"
+        )
         return attn_output
