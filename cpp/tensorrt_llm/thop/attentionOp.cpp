@@ -78,7 +78,8 @@ public:
         torch::optional<torch::Tensor> mrope_rotary_cos_sin, torch::optional<torch::Tensor> mrope_position_deltas,
         torch::optional<torch::Tensor> mla_context_paged_kv,
         torch::optional<torch::Tensor> mla_context_kv_cache_block_offsets,
-        torch::optional<torch::Tensor> softmax_stats_tensor) const
+        torch::optional<torch::Tensor> softmax_stats_tensor,
+        torch::optional<torch::Tensor> helix_position_offsets) const
         = 0;
 };
 
