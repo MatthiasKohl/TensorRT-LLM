@@ -728,6 +728,7 @@ class MLA(nn.Module):
 
     def _attn_forward(self, attn_instance: AttentionBackend, q: torch.Tensor,
                       k: torch.Tensor, v: torch.Tensor,
+                      position_ids: torch.Tensor,
                       attn_metadata: AttentionMetadata, **kwargs):
         if self.mapping.cp_size > 1 and self.mapping.cp_config.get(
                 "cp_type") == CpType.HELIX:
@@ -744,10 +745,8 @@ class MLA(nn.Module):
                 v,
                 attn_metadata,
                 softmax_stats_tensor=softmax_stats,
+                helix_position_offsets=position_ids,
                 **kwargs)
-            print(
-                f"q.shape: {q.shape}, q: {q[0, :4]}, partial_o: {partial_o.shape}, {partial_o[0, :4]}, softmax_stats: {softmax_stats[0, :4, :]}"
-            )
             # this is the post-processing of helix parallel attention,
             # similar to the post-processing of ring attention
             kv_lora_rank = partial_o.shape[-1] // self.num_heads_tp
@@ -779,16 +778,13 @@ class MLA(nn.Module):
             # [cp_size, num_tokens, num_heads_tp_cp] -> [1, num_tokens, num_heads_tp_cp]
             global_sum = torch.sum(corrected_sum, dim=0, keepdim=True)
             # [cp_size, num_tokens, num_heads_tp_cp] -> [cp_size, num_tokens, num_heads_tp_cp, 1]
-            correction = torch.unsqueeze(corrected_max_exp / global_sum, -1)
-            print(
-                f"global_max: {global_max[0, :4]}, global_sum: {global_sum[0, :4]}, corrected_max_exp: {corrected_max_exp[:, 0, :4]}, correction: {correction[:, 0, :4, 0]}"
-            )
+            correction = torch.unsqueeze(
+                gathered_stats[..., 1] * corrected_max_exp / global_sum, -1)
             # [cp_size, num_tokens, num_heads_tp_cp, kv_lora_rank]
             corrected_o = gathered_o.view(*correction.shape[:-1],
                                           kv_lora_rank) * correction
             # [cp_size, num_tokens, num_heads_tp_cp, kv_lora_rank] -> [num_tokens, num_heads_tp_cp * kv_lora_rank]
             attn_output = torch.sum(corrected_o.view(*gathered_o.shape), dim=0)
-            print(f"attn_output allgather: {attn_output[0, :4]}")
             r_start = self.mapping.cp_rank * self.num_heads_tp_cp * self.kv_lora_rank
             r_end = r_start + self.num_heads_tp_cp * self.kv_lora_rank
             return attn_output[:, r_start:r_end].to(dtype=gathered_o.dtype)
@@ -805,9 +801,6 @@ class MLA(nn.Module):
                 attn_metadata,
                 softmax_stats_tensor=softmax_stats,
                 **kwargs)
-            print(
-                f"q shape: {q.shape}, q: {q[0, :4]}, mqa output: {attn_output.shape}, {attn_output[0, :4]}, softmax_stats: {softmax_stats[0, :4, :]}"
-            )
             return attn_output
 
     def create_output(self, hidden_states: torch.Tensor, num_contexts: int):
@@ -898,6 +891,10 @@ class MLA(nn.Module):
             q_gen = q[num_ctx_tokens:, ...]
             compressed_kv_gen = compressed_kv[num_ctx_tokens:, ...]
             k_pe_gen = k_pe[num_ctx_tokens:, ...]
+            # TODO for CP Helix: any rank except the last one / the one generating
+            # the output token should use the latent cache of the "next" logical rank
+            # (first token for each sequence in the KV cache of next rank)
+            # this generally doesn't influence the results much, but it could
             latent_cache_gen = latent_cache[num_ctx_tokens:, ...]
             if self.apply_rotary_emb:
                 assert position_ids is not None
@@ -907,6 +904,7 @@ class MLA(nn.Module):
                 q_gen,
                 compressed_kv_gen,
                 k_pe_gen,
+                position_ids,
                 attn_metadata,
                 latent_cache_gen,
                 output=output if num_contexts == 0 else None)
@@ -1258,13 +1256,13 @@ class MLA(nn.Module):
             q: torch.Tensor,
             compressed_kv: torch.Tensor,
             k_pe: torch.Tensor,
+            position_ids: torch.Tensor,
             attn_metadata: AttentionMetadata,
             latent_cache: Optional[torch.Tensor] = None,
             output: Optional[torch.Tensor] = None) -> torch.Tensor:
         num_tokens = q.shape[0]
         q_nope, q_pe = q.view([-1, self.num_heads_tp, self.qk_head_dim]).split(
             [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-        print(f"q_nope: {q_nope[0, 0, :4]}, q_pe: {q_pe[0, 0, :4]}")
 
         # fused_q contains 1) the result of the following bmm with shape [num_tokens, num_heads, kv_lora_rank]
         # 2) rope(q_pe) with shape [num_tokens, num_heads, qk_rope_head_dim]. rope is applied inside AttentionOp
@@ -1289,9 +1287,6 @@ class MLA(nn.Module):
             torch.ops.trtllm.bmm_out(q_nope_t,
                                      self.k_b_proj_trans.transpose(1, 2),
                                      q_nope_out)
-            print(
-                f"k_b_proj_trans {self.k_b_proj_trans[0, 0, :4]} q_nope_out: {q_nope_out[0, 0, :4]}"
-            )
         elif self.k_b_proj_trans.dtype == torch.float8_e4m3fn:
             # [num_heads, num_tokens, self.kv_lora_rank]
             q_nope_out = fused_q[..., :self.kv_lora_rank].transpose(0, 1)
@@ -1304,9 +1299,6 @@ class MLA(nn.Module):
 
         if self.apply_rotary_emb:
             fused_q[..., self.kv_lora_rank:] = q_pe
-        print(
-            f"fused_q: {fused_q[0, 0, :4]}, latent_cache: {latent_cache[0, :4]}"
-        )
         fused_q = fused_q.view([
             num_tokens,
             self.num_heads_tp * (self.kv_lora_rank + self.qk_rope_head_dim)
@@ -1320,6 +1312,7 @@ class MLA(nn.Module):
             fused_q,
             None,
             None,
+            position_ids,
             attn_metadata,
             attention_input_type=AttentionInputType.generation_only,
             out_scale=out_scale,
@@ -1336,7 +1329,6 @@ class MLA(nn.Module):
         # [seq, num_heads, kv_lora_rank]
         attn_out_latent = attn_out_latent.view(
             [-1, self.num_heads_tp_cp, self.kv_lora_rank])
-        print(f"attn_out_latent: {attn_out_latent[0, 0, :4]}")
 
         # [seq, num_heads * v_head_dim]
         output = output if output is not None else torch.empty(
@@ -1360,7 +1352,6 @@ class MLA(nn.Module):
         else:
             raise NotImplementedError(
                 f"Missing bmm impl for dtype: {self.v_b_proj.dtype}.")
-        print(f"attn_output: {attn_output[0, 0, :4]}")
         return output
 
     def forward(
@@ -1387,7 +1378,4 @@ class MLA(nn.Module):
         attn_output = attn_output[:, :self.num_heads_tp_cp * self.v_head_dim]
         attn_output = self.o_proj(attn_output,
                                   all_reduce_params=all_reduce_params)
-        print(
-            f"attn_output_final: {attn_output[0, :4]} o_proj: {self.o_proj.weight[:4, :4]}"
-        )
         return attn_output

@@ -129,7 +129,8 @@ public:
         torch::optional<torch::Tensor> mrope_rotary_cos_sin, torch::optional<torch::Tensor> mrope_position_deltas,
         torch::optional<torch::Tensor> mla_context_paged_kv,
         torch::optional<torch::Tensor> mla_context_kv_cache_block_offsets,
-        torch::optional<torch::Tensor> softmax_stats_tensor) const override
+        torch::optional<torch::Tensor> softmax_stats_tensor,
+        torch::optional<torch::Tensor> helix_position_offsets) const override
     {
         auto stream = at::cuda::getCurrentCUDAStream(qkv.get_device());
         T* attention_input = static_cast<T*>(qkv.slice(0, token_offset).data_ptr());
@@ -189,6 +190,10 @@ public:
             mla_params.meta = op.mMLAParams;
 
             mla_params.workspace = workspace_ptr;
+            if (helix_position_offsets.has_value())
+            {
+                mla_params.helix_position_offsets = helix_position_offsets.value().data_ptr<int32_t>();
+            }
         }
 
         int const* context_lengths_ptr = context_lengths.slice(0, seq_offset).data_ptr<int>();
@@ -395,7 +400,8 @@ void attention_inplace(torch::Tensor q, torch::optional<torch::Tensor> k, torch:
     std::optional<int64_t> qk_rope_head_dim, std::optional<int64_t> v_head_dim,
     torch::optional<torch::Tensor> mrope_rotary_cos_sin, torch::optional<torch::Tensor> mrope_position_deltas,
     std::optional<torch::Tensor> mla_context_paged_kv, std::optional<torch::Tensor> mla_context_kv_cache_block_offsets,
-    std::optional<int64_t> attention_chunk_size, std::optional<torch::Tensor> softmax_stats_tensor)
+    std::optional<int64_t> attention_chunk_size, std::optional<torch::Tensor> softmax_stats_tensor,
+    std::optional<torch::Tensor> helix_position_offsets)
 {
     TLLM_LOG_TRACE("Attention op starts at layer %d", layer_idx);
     // Use these tensors to infer if the attention is using KV cache
@@ -613,7 +619,7 @@ void attention_inplace(torch::Tensor q, torch::optional<torch::Tensor> k, torch:
             host_kv_cache_block_offsets, host_kv_cache_pool_pointers, host_kv_cache_pool_mapping, cache_indirection,
             kv_scale_orig_quant, kv_scale_quant_orig, out_scale, rotary_inv_freq, rotary_cos_sin, latent_cache, q_pe,
             block_ids_per_seq, mrope_rotary_cos_sin, mrope_position_deltas, mla_context_paged_kv,
-            mla_context_kv_cache_block_offsets, softmax_stats_tensor);
+            mla_context_kv_cache_block_offsets, softmax_stats_tensor, helix_position_offsets);
     }
 
     if ((num_generations > 0) && (attn_input_type != AttentionInputType::ContextOnly))
@@ -629,7 +635,7 @@ void attention_inplace(torch::Tensor q, torch::optional<torch::Tensor> k, torch:
             host_kv_cache_block_offsets, host_kv_cache_pool_pointers, host_kv_cache_pool_mapping, cache_indirection,
             kv_scale_orig_quant, kv_scale_quant_orig, out_scale, rotary_inv_freq, rotary_cos_sin, latent_cache, q_pe,
             block_ids_per_seq, mrope_rotary_cos_sin, mrope_position_deltas, mla_context_paged_kv,
-            mla_context_kv_cache_block_offsets, softmax_stats_tensor);
+            mla_context_kv_cache_block_offsets, softmax_stats_tensor, helix_position_offsets);
     }
 
     TLLM_LOG_TRACE("Attention op stops at layer %d", layer_idx);
@@ -753,6 +759,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         ", Tensor? mla_context_kv_cache_block_offsets"
         ", int? attention_chunk_size"
         ", Tensor? softmax_stats_tensor"
+        ", Tensor? helix_position_offsets"
         ") -> ()");
 
     m.def("attention_supports_nvfp4_output", &torch_ext::attention_supports_nvfp4_output);

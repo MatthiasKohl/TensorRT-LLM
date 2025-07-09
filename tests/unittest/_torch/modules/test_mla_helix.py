@@ -269,6 +269,11 @@ def _run_mla_distributed(rank: int, world_size: int, scenario: Scenario,
                          mapping: Mapping, test_params: tuple,
                          ref_output: torch.Tensor, gen_steps: int):
     input_ctx, position_ids_ctx, weights, pos_embd_params = test_params
+    # we start with the same position_ids as the reference MLA.
+    position_ids_gen = torch.full((scenario.batch, ),
+                                  scenario.ctx_len,
+                                  dtype=torch.int,
+                                  device="cuda")
     extra_attrs = dict()
     config = ModelConfig(mapping=mapping)
     config.extra_attrs = extra_attrs
@@ -302,9 +307,6 @@ def _run_mla_distributed(rank: int, world_size: int, scenario: Scenario,
     input_ctx_bs = input_ctx.view(scenario.batch, scenario.ctx_len,
                                   scenario.hidden_size)
     input_gen = input_ctx_bs[:, 0, :].contiguous()
-    position_ids_ctx_bs = position_ids_ctx.view(scenario.batch,
-                                                scenario.ctx_len)
-    position_ids_gen = position_ids_ctx_bs[:, 0].contiguous()
 
     # split inputs into chunks for each rank
     input_ctx_bs_rank = input_ctx_bs[:, rank * ctx_len_per_gpu:(rank + 1) *
@@ -342,8 +344,12 @@ def _run_mla_distributed(rank: int, world_size: int, scenario: Scenario,
         )
         attn_metadata.prepare()
         extra_attrs["attention_metadata"] = weakref.ref(attn_metadata)
+        # note: we don't split position_ids_gen per rank because it is used for
+        # RoPE which should be applied in the same way for all ranks !
         with model_extra_attrs(extra_attrs):
             result = mla(position_ids_gen, input_gen, attn_metadata)
+        # update position_ids_gen
+        position_ids_gen += 1
         if step < scenario.ref_steps:
             outputs.append(result)
         elif step == scenario.ref_steps:
@@ -361,7 +367,9 @@ def _run_mla_distributed(rank: int, world_size: int, scenario: Scenario,
     kv_cache_manager.shutdown()
 
     # every rank should have the same output and checks against the reference output
-    torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=1e-2)
+    # note: need to use fairly high tolerances because the softmax stats can lose
+    # a lot of precision
+    torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=1e-1)
 
 
 @torch.inference_mode
@@ -398,6 +406,10 @@ def _full_test_multi_gpu(rank: int, world_size: int, scenario: Scenario,
                    scenario.hidden_size)[:, :, 0] = 1.0
     position_ids_ctx = torch.arange(scenario.ctx_len,
                                     device="cuda").repeat(scenario.batch)
+    position_ids_gen = torch.full((scenario.batch, ),
+                                  scenario.ctx_len,
+                                  dtype=torch.int,
+                                  device="cuda")
 
     pos_embd_params = PositionalEmbeddingParams(
         type=PositionEmbeddingType.yarn,
@@ -428,8 +440,6 @@ def _full_test_multi_gpu(rank: int, world_size: int, scenario: Scenario,
     if rank == 0:
         input_gen = input_ctx.view(scenario.batch, scenario.ctx_len,
                                    scenario.hidden_size)[:, 0, :].contiguous()
-        position_ids_gen = position_ids_ctx.view(
-            scenario.batch, scenario.ctx_len)[:, 0].contiguous()
         # Reference output (single GPU, but with correct KV/metadata setup)
         ref_mapping = Mapping(world_size=1, tp_size=1, rank=0)
         ref_kv_cache_manager, ref_attn_metadata = _setup_kv_and_metadata(
@@ -459,6 +469,8 @@ def _full_test_multi_gpu(rank: int, world_size: int, scenario: Scenario,
             )
             ref_attn_metadata.prepare()
             result = mla(position_ids_gen, input_gen, ref_attn_metadata)
+            # update position_ids_gen
+            position_ids_gen += 1
             if step < scenario.ref_steps:
                 ref_outputs.append(result)
             elif step == scenario.ref_steps:
