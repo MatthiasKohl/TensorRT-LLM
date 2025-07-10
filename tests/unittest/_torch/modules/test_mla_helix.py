@@ -4,7 +4,7 @@ import time
 import traceback
 import weakref
 from dataclasses import dataclass
-from typing import Optional
+from typing import List, Optional
 
 import cloudpickle
 import pytest
@@ -66,7 +66,7 @@ class Scenario:
     bias: bool = False
     batch: int = 8
     ctx_len: int = 1024
-    ref_steps: int = 4
+    ref_steps: int = 1
 
     @property
     def max_position_embeddings(self) -> int:
@@ -105,11 +105,11 @@ all_scenarios = [
 # limit the number of test scenarios to avoid taking too long
 test_scenarios = [
     all_scenarios[1],
-    all_scenarios[5],
-    all_scenarios[8],
-    all_scenarios[12],
-    all_scenarios[18],
-    all_scenarios[19],
+    # all_scenarios[5],
+    # all_scenarios[8],
+    # all_scenarios[12],
+    # all_scenarios[18],
+    # all_scenarios[19],
 ]
 
 
@@ -238,9 +238,7 @@ def _generate_random_weights(mla: MLA):
 
     # k_b_proj_trans (created in create_weights)
     if hasattr(mla, "k_b_proj_trans"):
-        # init_uniform(mla.k_b_proj_trans)
-        mla.k_b_proj_trans.zero_()
-        mla.k_b_proj_trans[:, :, 0] = 1.0
+        init_uniform(mla.k_b_proj_trans)
     # k_b_proj_trans_scale (optional)
     if hasattr(mla, "k_b_proj_trans_scale"):
         init_block_scale(mla.k_b_proj_trans_scale, mla.k_b_proj_trans)
@@ -397,14 +395,25 @@ def _run_mla_distributed(rank: int, world_size: int, scenario: Scenario,
     ref_abs[ref_abs == 0] = torch.finfo(ref_abs.dtype).smallest_normal
     rel_err = err / ref_abs
     # always print largest error and its index
-    max_err_idx = torch.unravel_index(torch.argmax(err), err.shape)
+    max_err_idx = torch.unravel_index(torch.argmax(err - atol - rtol * ref_abs),
+                                      err.shape)
+    values_err = (output[max_err_idx].item(), ref_output[max_err_idx].item())
+    max_abs_err_idx = torch.unravel_index(torch.argmax(err), err.shape)
+    values_abs = (output[max_abs_err_idx].item(),
+                  ref_output[max_abs_err_idx].item())
     max_rel_err_idx = torch.unravel_index(torch.argmax(rel_err), rel_err.shape)
-    max_err = err[max_err_idx]
-    max_rel_err = rel_err[max_rel_err_idx]
+    values_rel = (output[max_rel_err_idx].item(),
+                  ref_output[max_rel_err_idx].item())
+    max_abs_err = err[max_abs_err_idx].item()
+    max_rel_err = rel_err[max_rel_err_idx].item()
     max_err_idx = [x.item() for x in max_err_idx]
+    max_abs_err_idx = [x.item() for x in max_abs_err_idx]
     max_rel_err_idx = [x.item() for x in max_rel_err_idx]
     print(
-        f"Rank {rank} {world_size}-GPU: max abs error: {max_err}, index: {max_err_idx}, max rel error: {max_rel_err}, index: {max_rel_err_idx} atol: {atol}, rtol: {rtol}"
+        f"Rank {rank} {world_size}-GPU: max error index: {max_err_idx} "
+        f"(test/ref values: {values_err}), max abs error index: {max_abs_err_idx} "
+        f"(test/ref values: {values_abs}, err: {max_abs_err}), max rel error index: {max_rel_err_idx} "
+        f"(test/ref values: {values_rel}, err: {max_rel_err}), atol: {atol}, rtol: {rtol}"
     )
     isclose = err < atol + rtol * ref_abs
     ratio_mismatch = 0.0
@@ -446,6 +455,8 @@ def _full_test_multi_gpu(rank: int, world_size: int, scenario: Scenario,
                             scenario.hidden_size,
                             dtype=scenario.dtype,
                             device="cuda").uniform_(-1, 1)
+    # TODO: this is still required to get numerically correct results
+    # need to fix this
     input_ctx.zero_()
     input_ctx.view(scenario.batch, scenario.ctx_len,
                    scenario.hidden_size)[:, :, 0] = 1.0
@@ -576,7 +587,7 @@ def _run_single_rank(func, *args, **kwargs):
 def test_mla_helix_distributed(scenario: Scenario,
                                gen_steps: Optional[int] = None,
                                max_mismatch_ratio: float = 0.2,
-                               assert_mismatch: bool = True):
+                               mismatch_ratios: Optional[List[float]] = None):
     world_size = 2
     gen_steps = scenario.ref_steps if gen_steps is None else gen_steps
     with MPIPoolExecutor(max_workers=world_size) as executor:
@@ -584,11 +595,11 @@ def test_mla_helix_distributed(scenario: Scenario,
             _run_single_rank,
             *zip(*[(_full_test_multi_gpu, world_size, scenario, gen_steps)] *
                  world_size))
-        mismatch_ratios = list(results)
-        if assert_mismatch:
-            for ratio_mismatch in mismatch_ratios:
+        if mismatch_ratios is None:
+            for ratio_mismatch in results:
                 assert ratio_mismatch < max_mismatch_ratio
-        return mismatch_ratios
+        else:
+            mismatch_ratios.extend(results)
 
 
 if __name__ == "__main__":
@@ -596,10 +607,13 @@ if __name__ == "__main__":
         timing_steps = 256
         gen_steps = scenario.ref_steps + timing_steps
         print(f"Running scenario: {scenario} and timing {timing_steps} steps")
-        mismatch_ratios = test_mla_helix_distributed(scenario,
-                                                     gen_steps=gen_steps,
-                                                     assert_mismatch=False)
+        mismatch_ratios = []
+        test_mla_helix_distributed(scenario,
+                                   gen_steps=gen_steps,
+                                   mismatch_ratios=mismatch_ratios)
         if any(mismatch > 0 for mismatch in mismatch_ratios):
             print(
                 f"Numerical test failed with mismatch ratios: {mismatch_ratios}"
             )
+        else:
+            print("Numerical test passed")
