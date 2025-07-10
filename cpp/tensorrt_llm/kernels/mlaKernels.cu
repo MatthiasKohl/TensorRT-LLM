@@ -432,9 +432,8 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
 
             if (valid_token)
             {
-
                 auto const position_id
-                    = (helix_position_offsets != nullptr ? helix_position_offsets[batch_idx]
+                    = (helix_position_offsets != nullptr ? helix_position_offsets[global_token_idx]
                                                          : kv_cache_lengths[batch_idx] - seq_len + local_token_idx);
                 float2 const* rotary_coef_cache_buffer
                     = cos_sin_cache + static_cast<size_t>(ROPE_DIM) * position_id + (head_dim_idx / 2);

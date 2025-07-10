@@ -814,11 +814,13 @@ class MLA(nn.Module):
         return hidden_states.new_empty([num_tokens, hidden_size],
                                        dtype=hidden_states.dtype)
 
-    def forward_impl(self,
-                     position_ids: Optional[torch.Tensor],
-                     hidden_states: torch.Tensor,
-                     attn_metadata: AttentionMetadata,
-                     output: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward_impl(
+            self,
+            position_ids: Optional[torch.Tensor],
+            hidden_states: torch.Tensor,
+            attn_metadata: AttentionMetadata,
+            output: Optional[torch.Tensor] = None,
+            latent_cache_gen: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Forward pass for the MLA module.
 
@@ -895,7 +897,10 @@ class MLA(nn.Module):
             # the output token should use the latent cache of the "next" logical rank
             # (first token for each sequence in the KV cache of next rank)
             # this generally doesn't influence the results much, but it could
-            latent_cache_gen = latent_cache[num_ctx_tokens:, ...]
+            # for now, we solve it by allowing to pass a custom latent cache for generation
+            latent_cache_gen = latent_cache[
+                num_ctx_tokens:,
+                ...] if latent_cache_gen is None else latent_cache_gen
             if self.apply_rotary_emb:
                 assert position_ids is not None
                 k_pe_gen = self.apply_rope(q_gen, k_pe_gen, position_ids)
@@ -1360,6 +1365,7 @@ class MLA(nn.Module):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         all_reduce_params: Optional[AllReduceParams] = None,
+        latent_cache_gen: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
 
         attn_output = self.create_output(hidden_states,
@@ -1372,7 +1378,8 @@ class MLA(nn.Module):
             self.forward_impl(position_ids,
                               hidden_states,
                               attn_metadata,
-                              output=attn_output)
+                              output=attn_output,
+                              latent_cache_gen=latent_cache_gen)
         # note: for testing Helix parallelism, we ensure that the output is
         # compatible with o_proj, thus we cut it to num_heads_tp_cp * v_head_dim
         attn_output = attn_output[:, :self.num_heads_tp_cp * self.v_head_dim]

@@ -258,6 +258,21 @@ def _copy_to_cp(weights, param_name, dim, rank, world_size):
     weights[param_name] = weights[param_name][slices]
 
 
+def _make_latent_cache_gen(mla: MLA, rank: int, world_size: int,
+                           ctx_len_per_gpu: int, input_ctx_bs: torch.Tensor):
+    if rank == world_size - 1:
+        return None
+    input_ctx_rank = input_ctx_bs[:, (rank + 1) * ctx_len_per_gpu, :]
+    if mla.is_lite:
+        compressed_kv, k_pe = mla.fused_a(input_ctx_rank).split(
+            [mla.kv_lora_rank, mla.qk_rope_head_dim], -1)
+    else:
+        _, compressed_kv, k_pe = mla.fused_a(input_ctx_rank).split(
+            [mla.q_lora_rank, mla.kv_lora_rank, mla.qk_rope_head_dim], -1)
+    compressed_kv = mla.kv_a_layernorm(compressed_kv)
+    return torch.concat([compressed_kv, k_pe], dim=-1),
+
+
 def _run_mla_distributed(rank: int, world_size: int, scenario: Scenario,
                          mapping: Mapping, test_params: tuple,
                          ref_output: torch.Tensor, gen_steps: int):
@@ -316,6 +331,11 @@ def _run_mla_distributed(rank: int, world_size: int, scenario: Scenario,
     # this represents the context step
     with model_extra_attrs(extra_attrs):
         mla(position_ids_ctx_rank, input_ctx_rank, attn_metadata)
+
+    # for non-last rank, generate the right latent cache for generation
+    latent_cache_gen = _make_latent_cache_gen(mla, rank, world_size,
+                                              ctx_len_per_gpu, input_ctx_bs)
+
     outputs = []
     start = time.time()
     for step in range(gen_steps):
@@ -344,7 +364,10 @@ def _run_mla_distributed(rank: int, world_size: int, scenario: Scenario,
         # note: we don't split position_ids_gen per rank because it is used for
         # RoPE which should be applied in the same way for all ranks !
         with model_extra_attrs(extra_attrs):
-            result = mla(position_ids_gen, input_gen, attn_metadata)
+            result = mla(position_ids_gen,
+                         input_gen,
+                         attn_metadata,
+                         latent_cache_gen=latent_cache_gen)
         # update position_ids_gen
         position_ids_gen += 1
         if step < scenario.ref_steps:

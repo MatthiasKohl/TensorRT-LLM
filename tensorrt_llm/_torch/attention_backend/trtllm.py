@@ -205,7 +205,7 @@ class TrtllmAttentionWrapper:
             mla_context_paged_kv (torch.Tensor): The paged KV cache for MLA context, for kv cache reuse/chunked context.
             mla_context_kv_cache_block_offsets (torch.Tensor): The block offsets for the paged KV cache for MLA context, for kv cache reuse/chunked context.
             softmax_stats_tensor (torch.Tensor): The tensor to store the softmax statistics (max/sum)
-            helix_position_offsets (torch.Tensor): The tensor to store the helix position offsets, with shape (batch_size) on GPU.
+            helix_position_offsets (torch.Tensor): The tensor to store the helix position offsets, with shape (num_tokens) on GPU.
         """
         self.layer_idx = layer_idx
         self.tokens_per_block = tokens_per_block
