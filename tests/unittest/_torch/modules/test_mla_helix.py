@@ -197,21 +197,13 @@ def _setup_kv_and_metadata(scenario: Scenario, mapping: Mapping,
 
 def _generate_random_weights(mla: MLA):
     # Helper to init a tensor
-    # TODO need to debug numerically when using non-zero values
     def init_uniform(tensor, a=-1.0, b=1.0):
         if tensor is not None:
             torch.nn.init.uniform_(tensor, a=a, b=b)
-            # tensor.fill_(0.0)
-    def init_noproj(tensor):
-        if tensor is not None:
-            tensor.zero_()
-            tensor[:, 0] = 1.0
-            # tensor.fill_(0.0)
 
     def init_block_scale(tensor, orig_tensor):
         if tensor is None or orig_tensor is None:
             return
-        # tensor.fill_(0.0)
         x = orig_tensor.view(*orig_tensor.shape[:-2],
                              orig_tensor.shape[-2] // 128, 128,
                              orig_tensor.shape[-1] // 128, 128)
@@ -239,7 +231,7 @@ def _generate_random_weights(mla: MLA):
     for name in ["q_b_proj", "q_proj"]:
         mod = getattr(mla, name, None)
         if mod is not None:
-            init_noproj(mod.weight)
+            init_uniform(mod.weight)
             if hasattr(mod, "bias"):
                 init_uniform(mod.bias)
 
@@ -313,6 +305,8 @@ def _run_mla_distributed(rank: int, world_size: int, scenario: Scenario,
                                      ctx_len_per_gpu, :]
     input_ctx_rank = input_ctx_bs_rank.reshape(
         scenario.batch * ctx_len_per_gpu, scenario.hidden_size).contiguous()
+    position_ids_ctx_bs = position_ids_ctx.view(scenario.batch,
+                                                scenario.ctx_len)
     position_ids_ctx_bs_rank = position_ids_ctx_bs[:, rank *
                                                    ctx_len_per_gpu:(rank + 1) *
                                                    ctx_len_per_gpu]
@@ -326,6 +320,10 @@ def _run_mla_distributed(rank: int, world_size: int, scenario: Scenario,
     for step in range(gen_steps):
         for req_id in range(scenario.batch):
             kv_cache_manager.impl.add_token(req_id)
+        cache_add = step if rank == world_size - 1 else 0
+        cached_tokens_per_seq = [
+            ctx_len_per_gpu + cache_add for _ in range(scenario.batch)
+        ]
         attn_metadata = get_attention_backend("TRTLLM").Metadata(
             seq_lens=torch.tensor([1] * scenario.batch, dtype=torch.int),
             request_ids=list(range(scenario.batch)),
@@ -336,9 +334,7 @@ def _run_mla_distributed(rank: int, world_size: int, scenario: Scenario,
             kv_cache_manager=kv_cache_manager,
             kv_cache_params=KVCacheParams(
                 use_cache=True,
-                num_cached_tokens_per_seq=[
-                    ctx_len_per_gpu + step for _ in range(scenario.batch)
-                ],
+                num_cached_tokens_per_seq=cached_tokens_per_seq,
             ),
             enable_paged_context_mla=True,
         )
