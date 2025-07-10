@@ -370,10 +370,13 @@ def _run_mla_distributed(rank: int, world_size: int, scenario: Scenario,
 
     err = torch.abs(output - ref_output)
     ref_abs = torch.abs(ref_output)
+    ref_abs[ref_abs == 0] = torch.finfo(ref_abs.dtype).smallest_normal
     rel_err = err / ref_abs
     # always print largest error and its index
-    max_err, max_err_idx = torch.max(err, None)
-    max_rel_err, max_rel_err_idx = torch.max(rel_err, None)
+    max_err_idx = torch.unravel_index(torch.argmax(err), err.shape)
+    max_rel_err_idx = torch.unravel_index(torch.argmax(rel_err), rel_err.shape)
+    max_err = err[max_err_idx]
+    max_rel_err = rel_err[max_rel_err_idx]
     print(
         f"Rank {rank} {world_size}-GPU: max abs error: {max_err}, index: {max_err_idx}, max rel error: {max_rel_err}, index: {max_rel_err_idx}"
     )
