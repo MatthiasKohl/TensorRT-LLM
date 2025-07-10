@@ -4,6 +4,7 @@ import time
 import traceback
 import weakref
 from dataclasses import dataclass
+from typing import Optional
 
 import cloudpickle
 import pytest
@@ -550,11 +551,12 @@ def _run_single_rank(func, *args, **kwargs):
 # allow up to 15% mismatch for now, due to how latent cache is not set correctly for non-last rank
 # TODO: fix this
 def test_mla_helix_distributed(scenario: Scenario,
+                               gen_steps: Optional[int] = None,
                                max_mismatch_ratio: float = 0.15,
                                assert_mismatch: bool = True):
     world_size = 2
+    gen_steps = scenario.ref_steps if gen_steps is None else gen_steps
     with MPIPoolExecutor(max_workers=world_size) as executor:
-        gen_steps = scenario.ref_steps
         results = executor.map(
             _run_single_rank,
             *zip(*[(_full_test_multi_gpu, world_size, scenario, gen_steps)] *
@@ -572,6 +574,7 @@ if __name__ == "__main__":
         gen_steps = scenario.ref_steps + timing_steps
         print(f"Running scenario: {scenario} and timing {timing_steps} steps")
         mismatch_ratios = test_mla_helix_distributed(scenario,
+                                                     gen_steps=gen_steps,
                                                      assert_mismatch=False)
         if any(mismatch > 0 for mismatch in mismatch_ratios):
             print(
