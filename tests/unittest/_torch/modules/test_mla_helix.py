@@ -103,12 +103,12 @@ all_scenarios = [
 
 # limit the number of test scenarios to avoid taking too long
 test_scenarios = [
-    # all_scenarios[1],
-    # all_scenarios[5],
-    # all_scenarios[8],
+    all_scenarios[1],
+    all_scenarios[5],
+    all_scenarios[8],
     all_scenarios[12],
-    # all_scenarios[18],
-    # all_scenarios[19],
+    all_scenarios[18],
+    all_scenarios[19],
 ]
 
 
@@ -372,8 +372,8 @@ def _run_mla_distributed(rank: int, world_size: int, scenario: Scenario,
     ref_abs = torch.abs(ref_output)
     rel_err = err / ref_abs
     # always print largest error and its index
-    max_err, max_err_idx = err.max()
-    max_rel_err, max_rel_err_idx = rel_err.max()
+    max_err, max_err_idx = torch.max(err, None)
+    max_rel_err, max_rel_err_idx = torch.max(rel_err, None)
     print(
         f"Rank {rank} {world_size}-GPU: max abs error: {max_err}, index: {max_err_idx}, max rel error: {max_rel_err}, index: {max_rel_err_idx}"
     )
