@@ -383,15 +383,14 @@ def _run_mla_distributed(rank: int, world_size: int, scenario: Scenario,
         f"Rank {rank} {world_size}-GPU: max abs error: {max_err}, index: {max_err_idx}, max rel error: {max_rel_err}, index: {max_rel_err_idx} atol: {atol}, rtol: {rtol}"
     )
     isclose = err < atol + rtol * ref_abs
+    ratio_mismatch = 0.0
     if not isclose.all().item():
         n_mismatch = (isclose == False).sum().item()
         ratio_mismatch = n_mismatch / output.numel()
         print(
-            f"Rank {rank} {world_size}-GPU: {n_mismatch} mismatches, ratio: {ratio_mismatch}"
+            f"Rank {rank} {world_size}-GPU: {n_mismatch}/{output.numel()} mismatches: {ratio_mismatch}"
         )
-        # allow up to 15% mismatch for now, due to how latent cache is not set correctly for non-last rank
-        # TODO: fix this
-        assert ratio_mismatch < 0.15
+    return ratio_mismatch
 
 
 @torch.inference_mode
@@ -525,8 +524,8 @@ def _full_test_multi_gpu(rank: int, world_size: int, scenario: Scenario,
     # we only need the values from rank 0
     ref_output = ref_output_all.view(world_size, *ref_output.shape)[0]
     test_params = (input_ctx, position_ids_ctx, weights, pos_embd_params)
-    _run_mla_distributed(rank, world_size, scenario, mapping, test_params,
-                         ref_output, gen_steps)
+    return _run_mla_distributed(rank, world_size, scenario, mapping,
+                                test_params, ref_output, gen_steps)
 
 
 def _run_single_rank(func, *args, **kwargs):
@@ -548,7 +547,11 @@ def _run_single_rank(func, *args, **kwargs):
 @pytest.mark.parametrize("scenario",
                          test_scenarios,
                          ids=lambda x: f"scenario: {x}")
-def test_mla_helix_distributed(scenario: Scenario):
+# allow up to 15% mismatch for now, due to how latent cache is not set correctly for non-last rank
+# TODO: fix this
+def test_mla_helix_distributed(scenario: Scenario,
+                               max_mismatch_ratio: float = 0.15,
+                               assert_mismatch: bool = True):
     world_size = 2
     with MPIPoolExecutor(max_workers=world_size) as executor:
         gen_steps = scenario.ref_steps
@@ -556,13 +559,21 @@ def test_mla_helix_distributed(scenario: Scenario):
             _run_single_rank,
             *zip(*[(_full_test_multi_gpu, world_size, scenario, gen_steps)] *
                  world_size))
-        for r in results:
-            assert r is None
+        mismatch_ratios = list(results)
+        if assert_mismatch:
+            for ratio_mismatch in mismatch_ratios:
+                assert ratio_mismatch < max_mismatch_ratio
+        return mismatch_ratios
 
 
 if __name__ == "__main__":
-    for scenario in test_scenarios:
+    for scenario in all_scenarios:
         timing_steps = 256
         gen_steps = scenario.ref_steps + timing_steps
         print(f"Running scenario: {scenario} and timing {timing_steps} steps")
-        test_mla_helix_distributed(scenario)
+        mismatch_ratios = test_mla_helix_distributed(scenario,
+                                                     assert_mismatch=False)
+        if any(mismatch > 0 for mismatch in mismatch_ratios):
+            print(
+                f"Numerical test failed with mismatch ratios: {mismatch_ratios}"
+            )
