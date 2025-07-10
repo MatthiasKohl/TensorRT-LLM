@@ -511,13 +511,13 @@ class TrtllmAttentionWrapper:
             self.qk_nope_head_dim,
             self.qk_rope_head_dim,
             self.v_head_dim,
-            self.mrope_rotary_cos_sin,
-            self.mrope_position_deltas,
-            self.mla_context_paged_kv,
-            self.mla_context_kv_cache_block_offsets,
             self.attention_chunk_size,
-            self.softmax_stats_tensor,
-            self.helix_position_offsets,
+            [
+                self.mrope_rotary_cos_sin, self.mrope_position_deltas,
+                self.mla_context_paged_kv,
+                self.mla_context_kv_cache_block_offsets,
+                self.softmax_stats_tensor, self.helix_position_offsets
+            ],
         )
 
         # reset the planned states (especially tensors) to avoid memory leak
