@@ -330,6 +330,11 @@ def _run_mla_distributed(rank: int, world_size: int, scenario: Scenario,
     with model_extra_attrs(extra_attrs):
         mla(position_ids_ctx_rank, input_ctx_rank, attn_metadata)
 
+    buf = attn_metadata.kv_cache_manager.get_buffers(0)
+    print(f"Rank {rank} {world_size}-GPU: First few elements of KV cache: ",
+          buf.shape, buf[0, 0, 0, 0, :10],
+          buf[0, 0, 0, 0, scenario.kv_lora_rank:scenario.kv_lora_rank + 10],
+          input_ctx_rank[0, :10], position_ids_ctx_rank[0])
     # for non-last rank, generate the right latent cache for generation
     latent_cache_gen = _make_latent_cache_gen(mla, rank, world_size,
                                               ctx_len_per_gpu, input_ctx_bs)
@@ -502,6 +507,20 @@ def _full_test_multi_gpu(rank: int, world_size: int, scenario: Scenario,
             scenario, ref_mapping, gen_steps)
         # this represents the context step
         mla(position_ids_ctx, input_ctx, ref_attn_metadata)
+        buf = ref_attn_metadata.kv_cache_manager.get_buffers(0)
+        print("First few elements of ref KV cache: ", buf.shape, buf[0, 0, 0,
+                                                                     0, :10],
+              buf[0, 0, 0, 0, scenario.kv_lora_rank:scenario.kv_lora_rank + 10],
+              input_ctx[0, :10], position_ids_ctx[0])
+        block, tok = divmod(scenario.ctx_len // world_size,
+                            scenario.kv_cache_tokens_per_block)
+        print(
+            "First few elements of ref KV cache: ", buf.shape, buf[block, 0,
+                                                                   tok, 0, :10],
+            buf[block, 0, tok, 0,
+                scenario.kv_lora_rank:scenario.kv_lora_rank + 10],
+            input_ctx[scenario.ctx_len // world_size, :10],
+            position_ids_ctx[scenario.ctx_len // world_size])
         ref_outputs = []
         start = time.time()
         for step in range(gen_steps):

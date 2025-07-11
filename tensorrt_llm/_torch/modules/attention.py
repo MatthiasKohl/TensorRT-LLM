@@ -7,7 +7,7 @@ from torch import nn
 
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
-from tensorrt_llm.mapping import CpType, Mapping
+from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import (AttentionInputType, AttentionMetadata,
                                  TrtllmAttention, TrtllmAttentionMetadata)
@@ -730,8 +730,7 @@ class MLA(nn.Module):
                       k: torch.Tensor, v: torch.Tensor,
                       position_ids: torch.Tensor,
                       attn_metadata: AttentionMetadata, **kwargs):
-        if self.mapping.cp_size > 1 and self.mapping.cp_config.get(
-                "cp_type") == CpType.HELIX:
+        if self.mapping.has_cp_helix():
             # partial_o: [num_tokens, num_heads_tp * kv_lora_rank]
             # softmax_stats: [num_tokens, num_heads_tp, 2]
             softmax_stats = torch.empty(q.shape[0],
@@ -881,6 +880,7 @@ class MLA(nn.Module):
                 q_ctx,
                 compressed_kv_ctx,
                 k_pe_ctx,
+                position_ids,
                 attn_metadata,
                 latent_cache_ctx,
                 output=output if num_generations == 0 else None)
@@ -951,6 +951,7 @@ class MLA(nn.Module):
             q: torch.Tensor,
             compressed_kv: torch.Tensor,
             k_pe: torch.Tensor,
+            position_ids: torch.Tensor,
             attn_metadata: AttentionMetadata,
             latent_cache: Optional[torch.Tensor] = None,
             output: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -977,6 +978,9 @@ class MLA(nn.Module):
         # out_scale = getattr(self.o_proj, "inv_input_scale", None)
         out_scale = None  # Currently we use BF16 MHA for context phase
 
+        helix_position_offsets = position_ids if self.mapping.has_cp_helix(
+        ) else None
+
         attn_output = self.mha.forward(
             q,
             k,
@@ -984,6 +988,7 @@ class MLA(nn.Module):
             attn_metadata,
             attention_input_type=AttentionInputType.context_only,
             latent_cache=latent_cache,
+            helix_position_offsets=helix_position_offsets,
             out_scale=out_scale,
             output=output,
         )
@@ -1239,6 +1244,7 @@ class MLA(nn.Module):
         q: torch.Tensor,
         compressed_kv: torch.Tensor,
         k_pe: torch.Tensor,
+        position_ids: torch.Tensor,
         attn_metadata: AttentionMetadata,
         latent_cache: Optional[torch.Tensor] = None,
         output: Optional[torch.Tensor] = None,
@@ -1254,7 +1260,8 @@ class MLA(nn.Module):
                 return self.forward_context_with_cached_kv(
                     q, latent_cache, attn_metadata, output)
         return self.forward_context_default(q, compressed_kv, k_pe,
-                                            attn_metadata, latent_cache, output)
+                                            position_ids, attn_metadata,
+                                            latent_cache, output)
 
     def forward_generation(
             self,
