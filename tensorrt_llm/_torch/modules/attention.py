@@ -15,7 +15,7 @@ from ..attention_backend.interface import (AttentionBackend,
                                            PositionalEmbeddingParams,
                                            PredefinedAttentionMask)
 from ..attention_backend.utils import create_attention, get_attention_backend
-from ..distributed import AllReduceParams, cp_allgather
+from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
 from ..utils import Fp4QuantizedTensor, get_model_extra_attrs
@@ -730,6 +730,12 @@ class MLA(nn.Module):
                       k: torch.Tensor, v: torch.Tensor,
                       position_ids: torch.Tensor,
                       attn_metadata: AttentionMetadata, **kwargs):
+        print(
+            f"q: {q[0, :10] if q is not None else None}, k: {k[0, :10] if k is not None else None}, v: {v[0, :10] if v is not None else None}, position_ids: {position_ids[:10] if position_ids is not None else None}"
+        )
+        print(
+            f"q: {q[0, self.kv_lora_rank:self.kv_lora_rank + 10] if q is not None else None}, k: {k[0, self.kv_lora_rank:self.kv_lora_rank + 10] if k is not None else None}, v: {v[0, self.kv_lora_rank:self.kv_lora_rank + 10] if v is not None else None}, position_ids: {position_ids[:10] if position_ids is not None else None}"
+        )
         if self.mapping.has_cp_helix():
             # partial_o: [num_tokens, num_heads_tp * kv_lora_rank]
             # softmax_stats: [num_tokens, num_heads_tp, 2]
@@ -746,27 +752,28 @@ class MLA(nn.Module):
                 softmax_stats_tensor=softmax_stats,
                 helix_position_offsets=position_ids,
                 **kwargs)
+            print(f"softmax_stats: {softmax_stats[0, 0, :]}")
             # this is the post-processing of helix parallel attention,
             # similar to the post-processing of ring attention
             kv_lora_rank = partial_o.shape[-1] // self.num_heads_tp
             # note: if num_heads_tp is a multiple of cp_size, we split this correctly here
             # gathered_o: [cp_size, num_tokens, num_heads_tp_cp * kv_lora_rank]
             # gathered_stats: [cp_size, num_tokens, num_heads_tp_cp, 2]
-            # gathered_o, gathered_stats = alltoall(
-            #     [partial_o, softmax_stats],
-            #     self.mapping.cp_group,
-            #     dims=[-1, 1],
-            #     new_dims=[0, 0],
-            # )
-            all_gathered = cp_allgather([partial_o, softmax_stats],
-                                        self.mapping,
-                                        dim=0)
-            # [num_tokens, num_heads * v_head_dim] -> [cp_size, num_tokens, num_heads * v_head_dim]
-            gathered_o = all_gathered[0].view(self.mapping.cp_size,
-                                              *partial_o.shape)
-            # [num_tokens, num_heads, 2] -> [cp_size, num_tokens, num_heads, 2]
-            gathered_stats = all_gathered[1].view(self.mapping.cp_size,
-                                                  *softmax_stats.shape)
+            gathered_o, gathered_stats = alltoall(
+                [partial_o, softmax_stats],
+                self.mapping.cp_group,
+                dims=[-1, 1],
+                new_dims=[0, 0],
+            )
+            # all_gathered = cp_allgather([partial_o, softmax_stats],
+            #                             self.mapping,
+            #                             dim=0)
+            # # [num_tokens, num_heads_tp_cp * v_head_dim] -> [cp_size, num_tokens, num_heads_tp_cp * v_head_dim]
+            # gathered_o = all_gathered[0].view(self.mapping.cp_size,
+            #                                   *partial_o.shape)
+            # # [num_tokens, num_heads_tp_cp, 2] -> [cp_size, num_tokens, num_heads_tp_cp, 2]
+            # gathered_stats = all_gathered[1].view(self.mapping.cp_size,
+            #                                       *softmax_stats.shape)
             # [cp_size, num_tokens, num_heads_tp_cp] -> [1, num_tokens, num_heads_tp_cp]
             global_max = torch.max(gathered_stats[..., 0], dim=0,
                                    keepdim=True)[0]
@@ -784,10 +791,23 @@ class MLA(nn.Module):
                                           kv_lora_rank) * correction
             # [cp_size, num_tokens, num_heads_tp_cp, kv_lora_rank] -> [num_tokens, num_heads_tp_cp * kv_lora_rank]
             attn_output = torch.sum(corrected_o.view(*gathered_o.shape), dim=0)
+            assert self.kv_lora_rank == kv_lora_rank
             r_start = self.mapping.cp_rank * self.num_heads_tp_cp * self.kv_lora_rank
             r_end = r_start + self.num_heads_tp_cp * self.kv_lora_rank
-            return attn_output[:, r_start:r_end].to(dtype=gathered_o.dtype)
+            print(
+                f"attn_output gathered: {attn_output[0, :10]}, r_start: {r_start}, r_end: {r_end}"
+            )
+            print(
+                f"attn_output gathered: {attn_output[0, self.kv_lora_rank:self.kv_lora_rank+10]}, r_start: {r_start}, r_end: {r_end}"
+            )
+            return attn_output.to(dtype=gathered_o.dtype)
         else:
+            print(
+                f"q: {q[0, self.num_heads_tp // 2 * self.kv_lora_rank:self.num_heads_tp // 2 * self.kv_lora_rank + 10] if q is not None else None}, k: {k[0, self.num_heads_tp // 2 * self.kv_lora_rank:self.num_heads_tp // 2 * self.kv_lora_rank + 10] if k is not None else None}, v: {v[0, self.num_heads_tp // 2 * self.kv_lora_rank:self.num_heads_tp // 2 * self.kv_lora_rank + 10] if v is not None else None}, position_ids: {position_ids[:10] if position_ids is not None else None}"
+            )
+            print(
+                f"q: {q[0, self.num_heads_tp // 2 * self.kv_lora_rank + self.kv_lora_rank:self.num_heads_tp // 2 * self.kv_lora_rank + self.kv_lora_rank + 10] if q is not None else None}, k: {k[0, self.num_heads_tp // 2 * self.kv_lora_rank + self.kv_lora_rank:self.num_heads_tp // 2 * self.kv_lora_rank + self.kv_lora_rank + 10] if k is not None else None}, v: {v[0, self.num_heads_tp // 2 * self.kv_lora_rank + self.kv_lora_rank:self.num_heads_tp // 2 * self.kv_lora_rank + self.kv_lora_rank + 10] if v is not None else None}, position_ids: {position_ids[:10] if position_ids is not None else None}"
+            )
             softmax_stats = torch.empty(q.shape[0],
                                         self.num_heads_tp,
                                         2,
@@ -800,6 +820,17 @@ class MLA(nn.Module):
                 attn_metadata,
                 softmax_stats_tensor=softmax_stats,
                 **kwargs)
+            print(f"softmax_stats: {softmax_stats[0, 0, :]}")
+            print(f"attn_output gathered: {attn_output[0, :10]}")
+            print(
+                f"attn_output gathered: {attn_output[0, self.kv_lora_rank:self.kv_lora_rank + 10]}"
+            )
+            print(
+                f"attn_output gathered: {attn_output[0, self.num_heads_tp // 2 * self.kv_lora_rank:self.num_heads_tp // 2 * self.kv_lora_rank + 10]}"
+            )
+            print(
+                f"attn_output gathered: {attn_output[0, self.num_heads_tp // 2 * self.kv_lora_rank + self.kv_lora_rank:self.num_heads_tp // 2 * self.kv_lora_rank + self.kv_lora_rank + 10]}"
+            )
             return attn_output
 
     def create_output(self, hidden_states: torch.Tensor, num_contexts: int):
@@ -1275,6 +1306,8 @@ class MLA(nn.Module):
         num_tokens = q.shape[0]
         q_nope, q_pe = q.view([-1, self.num_heads_tp, self.qk_head_dim]).split(
             [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        # TODO it seems like q_pe is not the same in both cases, need to investigate
+        print(f"q_nope: {q_nope[0, :10]}, q_pe: {q_pe[0, :10]}")
 
         # fused_q contains 1) the result of the following bmm with shape [num_tokens, num_heads, kv_lora_rank]
         # 2) rope(q_pe) with shape [num_tokens, num_heads, qk_rope_head_dim]. rope is applied inside AttentionOp
@@ -1364,6 +1397,17 @@ class MLA(nn.Module):
         else:
             raise NotImplementedError(
                 f"Missing bmm impl for dtype: {self.v_b_proj.dtype}.")
+        if self.mapping.has_cp_helix():
+            print(
+                f"output: {attn_output[0, :2, :10]}, attn_out_latent: {attn_out_latent[0, :2, :10]}"
+            )
+        else:
+            print(
+                f"output: {attn_output[0, :2, :10]}, attn_out_latent: {attn_out_latent[0, :2, :10]}"
+            )
+            print(
+                f"output: {attn_output[0, self.num_heads_tp // 2:self.num_heads_tp // 2 + 2, :10]}, attn_out_latent: {attn_out_latent[0, self.num_heads_tp // 2:self.num_heads_tp // 2 + 2, :10]}"
+            )
         return output
 
     def forward(

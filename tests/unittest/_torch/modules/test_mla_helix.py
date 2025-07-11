@@ -371,6 +371,7 @@ def _run_mla_distributed(rank: int, world_size: int, scenario: Scenario,
                          input_gen,
                          attn_metadata,
                          latent_cache_gen=latent_cache_gen)
+        print(f"Rank {rank} {world_size}-GPU: result: {result[0, :10]}")
         # update position_ids_gen
         position_ids_gen += 1
         if step < scenario.ref_steps:
@@ -466,6 +467,7 @@ def _full_test_multi_gpu(rank: int, world_size: int, scenario: Scenario,
     input_ctx.view(scenario.batch, scenario.ctx_len,
                    scenario.hidden_size)[:, :, 0] = 1.0
     position_ids_ctx = torch.arange(scenario.ctx_len,
+                                    dtype=torch.int,
                                     device="cuda").repeat(scenario.batch)
     position_ids_gen = torch.full((scenario.batch, ),
                                   scenario.ctx_len,
@@ -544,6 +546,7 @@ def _full_test_multi_gpu(rank: int, world_size: int, scenario: Scenario,
             )
             ref_attn_metadata.prepare()
             result = mla(position_ids_gen, input_gen, ref_attn_metadata)
+            print(f"Ref result: {result[0, :10]}")
             # update position_ids_gen
             position_ids_gen += 1
             if step < scenario.ref_steps:
