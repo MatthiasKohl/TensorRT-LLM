@@ -15,7 +15,7 @@ from ..attention_backend.interface import (AttentionBackend,
                                            PositionalEmbeddingParams,
                                            PredefinedAttentionMask)
 from ..attention_backend.utils import create_attention, get_attention_backend
-from ..distributed import AllReduceParams
+from ..distributed import AllReduceParams, alltoall
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
 from ..utils import Fp4QuantizedTensor, get_model_extra_attrs
