@@ -62,6 +62,7 @@ class Scenario:
     rope_type: str = "yarn"
     model_type: str = "deepseek_v3"
     kv_cache_tokens_per_block: int = 64
+    # TODO only 1 is supported for now here
     predicted_tokens_per_seq: int = 1
     bias: bool = False
     batch: int = 8
@@ -198,9 +199,14 @@ def _setup_kv_and_metadata(scenario: Scenario, mapping: Mapping,
 
 def _generate_random_weights(mla: MLA):
     # Helper to init a tensor
-    def init_uniform(tensor, a=-1.0, b=1.0):
+    def init_uniform(tensor, a=-1.0, b=1.0, use_kaiming=False):
         if tensor is not None:
-            torch.nn.init.uniform_(tensor, a=a, b=b)
+            if use_kaiming:
+                tv = tensor.view(-1, tensor.shape[-2], tensor.shape[-1])
+                for t in tv:
+                    torch.nn.init.kaiming_uniform_(t)
+            else:
+                torch.nn.init.uniform_(tensor, a=a, b=b)
 
     def init_block_scale(tensor, orig_tensor):
         if tensor is None or orig_tensor is None:
@@ -215,7 +221,7 @@ def _generate_random_weights(mla: MLA):
     for name in ["fused_a", "kv_b_proj", "o_proj"]:
         mod = getattr(mla, name, None)
         if mod is not None:
-            init_uniform(mod.weight)
+            init_uniform(mod.weight, use_kaiming=True)
             if hasattr(mod, "bias"):
                 init_uniform(mod.bias)
 
@@ -232,13 +238,13 @@ def _generate_random_weights(mla: MLA):
     for name in ["q_b_proj", "q_proj"]:
         mod = getattr(mla, name, None)
         if mod is not None:
-            init_uniform(mod.weight)
+            init_uniform(mod.weight, use_kaiming=True)
             if hasattr(mod, "bias"):
                 init_uniform(mod.bias)
 
     # k_b_proj_trans (created in create_weights)
     if hasattr(mla, "k_b_proj_trans"):
-        init_uniform(mla.k_b_proj_trans)
+        init_uniform(mla.k_b_proj_trans, use_kaiming=True)
     # k_b_proj_trans_scale (optional)
     if hasattr(mla, "k_b_proj_trans_scale"):
         init_block_scale(mla.k_b_proj_trans_scale, mla.k_b_proj_trans)
@@ -268,7 +274,7 @@ def _make_latent_cache_gen(mla: MLA, rank: int, world_size: int,
         _, compressed_kv, k_pe = mla.fused_a(input_ctx_rank).split(
             [mla.q_lora_rank, mla.kv_lora_rank, mla.qk_rope_head_dim], -1)
     compressed_kv = mla.kv_a_layernorm(compressed_kv)
-    return torch.concat([compressed_kv, k_pe], dim=-1),
+    return torch.concat([compressed_kv, k_pe], dim=-1)
 
 
 def _run_mla_distributed(rank: int, world_size: int, scenario: Scenario,
@@ -332,12 +338,21 @@ def _run_mla_distributed(rank: int, world_size: int, scenario: Scenario,
 
     buf = attn_metadata.kv_cache_manager.get_buffers(0)
     print(f"Rank {rank} {world_size}-GPU: First few elements of KV cache: ",
-          buf.shape, buf[0, 0, 0, 0, :10],
-          buf[0, 0, 0, 0, scenario.kv_lora_rank:scenario.kv_lora_rank + 10],
+          buf.shape, buf[0, 0, :4, 0, :10],
+          buf[0, 0, :4, 0, scenario.kv_lora_rank:scenario.kv_lora_rank + 10],
           input_ctx_rank[0, :10], position_ids_ctx_rank[0])
     # for non-last rank, generate the right latent cache for generation
     latent_cache_gen = _make_latent_cache_gen(mla, rank, world_size,
                                               ctx_len_per_gpu, input_ctx_bs)
+    print(
+        f"Rank {rank} {world_size}-GPU: latent cache {None if latent_cache_gen is None else latent_cache_gen.shape}"
+    )
+    print(
+        f"Rank {rank} {world_size}-GPU: latent cache {None if latent_cache_gen is None else latent_cache_gen[0, :10]}"
+    )
+    print(
+        f"Rank {rank} {world_size}-GPU: latent cache {None if latent_cache_gen is None else latent_cache_gen[0, scenario.kv_lora_rank:scenario.kv_lora_rank + 10]}"
+    )
 
     outputs = []
     start = time.time()
@@ -510,17 +525,18 @@ def _full_test_multi_gpu(rank: int, world_size: int, scenario: Scenario,
         # this represents the context step
         mla(position_ids_ctx, input_ctx, ref_attn_metadata)
         buf = ref_attn_metadata.kv_cache_manager.get_buffers(0)
-        print("First few elements of ref KV cache: ", buf.shape, buf[0, 0, 0,
-                                                                     0, :10],
-              buf[0, 0, 0, 0, scenario.kv_lora_rank:scenario.kv_lora_rank + 10],
-              input_ctx[0, :10], position_ids_ctx[0])
+        print(
+            "First few elements of ref KV cache: ", buf.shape, buf[0, 0, :4,
+                                                                   0, :10],
+            buf[0, 0, :4, 0, scenario.kv_lora_rank:scenario.kv_lora_rank + 10],
+            input_ctx[0, :10], position_ids_ctx[0])
         block, tok = divmod(scenario.ctx_len // world_size,
                             scenario.kv_cache_tokens_per_block)
         print(
-            "First few elements of ref KV cache: ", buf.shape, buf[block, 0,
-                                                                   tok, 0, :10],
-            buf[block, 0, tok, 0,
-                scenario.kv_lora_rank:scenario.kv_lora_rank + 10],
+            "First few elements of ref KV cache: ", buf.shape,
+            buf[block, 0, tok:tok + 4,
+                0, :10], buf[block, 0, tok:tok + 4, 0,
+                             scenario.kv_lora_rank:scenario.kv_lora_rank + 10],
             input_ctx[scenario.ctx_len // world_size, :10],
             position_ids_ctx[scenario.ctx_len // world_size])
         ref_outputs = []
