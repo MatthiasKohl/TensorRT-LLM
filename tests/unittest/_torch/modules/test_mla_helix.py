@@ -106,11 +106,11 @@ all_scenarios = [
 # limit the number of test scenarios to avoid taking too long
 test_scenarios = [
     all_scenarios[1],
-    # all_scenarios[5],
-    # all_scenarios[8],
-    # all_scenarios[12],
-    # all_scenarios[18],
-    # all_scenarios[19],
+    all_scenarios[5],
+    all_scenarios[8],
+    all_scenarios[12],
+    all_scenarios[18],
+    all_scenarios[19],
 ]
 
 
@@ -336,23 +336,9 @@ def _run_mla_distributed(rank: int, world_size: int, scenario: Scenario,
     with model_extra_attrs(extra_attrs):
         mla(position_ids_ctx_rank, input_ctx_rank, attn_metadata)
 
-    buf = attn_metadata.kv_cache_manager.get_buffers(0)
-    print(f"Rank {rank} {world_size}-GPU: First few elements of KV cache: ",
-          buf.shape, buf[0, 0, :4, 0, :10],
-          buf[0, 0, :4, 0, scenario.kv_lora_rank:scenario.kv_lora_rank + 10],
-          input_ctx_rank[0, :10], position_ids_ctx_rank[0])
     # for non-last rank, generate the right latent cache for generation
     latent_cache_gen = _make_latent_cache_gen(mla, rank, world_size,
                                               ctx_len_per_gpu, input_ctx_bs)
-    print(
-        f"Rank {rank} {world_size}-GPU: latent cache {None if latent_cache_gen is None else latent_cache_gen.shape}"
-    )
-    print(
-        f"Rank {rank} {world_size}-GPU: latent cache {None if latent_cache_gen is None else latent_cache_gen[0, :10]}"
-    )
-    print(
-        f"Rank {rank} {world_size}-GPU: latent cache {None if latent_cache_gen is None else latent_cache_gen[0, scenario.kv_lora_rank:scenario.kv_lora_rank + 10]}"
-    )
 
     outputs = []
     start = time.time()
@@ -476,11 +462,6 @@ def _full_test_multi_gpu(rank: int, world_size: int, scenario: Scenario,
                             scenario.hidden_size,
                             dtype=scenario.dtype,
                             device="cuda").uniform_(-1, 1)
-    # TODO: this is still required to get numerically correct results
-    # need to fix this
-    input_ctx.zero_()
-    input_ctx.view(scenario.batch, scenario.ctx_len,
-                   scenario.hidden_size)[:, :, 0] = 1.0
     position_ids_ctx = torch.arange(scenario.ctx_len,
                                     dtype=torch.int,
                                     device="cuda").repeat(scenario.batch)
@@ -524,21 +505,6 @@ def _full_test_multi_gpu(rank: int, world_size: int, scenario: Scenario,
             scenario, ref_mapping, gen_steps)
         # this represents the context step
         mla(position_ids_ctx, input_ctx, ref_attn_metadata)
-        buf = ref_attn_metadata.kv_cache_manager.get_buffers(0)
-        print(
-            "First few elements of ref KV cache: ", buf.shape, buf[0, 0, :4,
-                                                                   0, :10],
-            buf[0, 0, :4, 0, scenario.kv_lora_rank:scenario.kv_lora_rank + 10],
-            input_ctx[0, :10], position_ids_ctx[0])
-        block, tok = divmod(scenario.ctx_len // world_size,
-                            scenario.kv_cache_tokens_per_block)
-        print(
-            "First few elements of ref KV cache: ", buf.shape,
-            buf[block, 0, tok:tok + 4,
-                0, :10], buf[block, 0, tok:tok + 4, 0,
-                             scenario.kv_lora_rank:scenario.kv_lora_rank + 10],
-            input_ctx[scenario.ctx_len // world_size, :10],
-            position_ids_ctx[scenario.ctx_len // world_size])
         ref_outputs = []
         start = time.time()
         for step in range(gen_steps):
@@ -620,11 +586,9 @@ def _run_single_rank(func, *args, **kwargs):
 @pytest.mark.parametrize("scenario",
                          test_scenarios,
                          ids=lambda x: f"scenario: {x}")
-# allow up to 20% mismatch for now, due to how latent cache is not set correctly for non-last rank
-# TODO: fix this
 def test_mla_helix_distributed(scenario: Scenario,
                                gen_steps: Optional[int] = None,
-                               max_mismatch_ratio: float = 0.2,
+                               max_mismatch_ratio: float = 0.0,
                                mismatch_ratios: Optional[List[float]] = None):
     world_size = 2
     gen_steps = scenario.ref_steps if gen_steps is None else gen_steps
