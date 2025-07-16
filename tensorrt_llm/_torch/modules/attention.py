@@ -610,7 +610,7 @@ class MLA(nn.Module):
         mscale_all_dim = pos_embd_params.rope.mscale_all_dim
         scaling_factor = pos_embd_params.rope.scale
         mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
-        q_scaling = 1.0 / (mscale * mscale)
+        self.q_scaling = 1.0 / (mscale * mscale)
 
         self.mha = create_attention(
             config.attn_backend,
@@ -620,7 +620,7 @@ class MLA(nn.Module):
             num_kv_heads=self.num_heads_tp,
             pos_embd_params=pos_embd_params,
             quant_config=quant_config,
-            q_scaling=q_scaling,
+            q_scaling=self.q_scaling,
             is_mla_enable=True,
             q_lora_rank=self.q_lora_rank,
             kv_lora_rank=self.kv_lora_rank,
@@ -639,7 +639,7 @@ class MLA(nn.Module):
             num_kv_heads=1,
             pos_embd_params=pos_embd_params,
             quant_config=quant_config,
-            q_scaling=q_scaling,
+            q_scaling=self.q_scaling,
             is_mla_enable=True,
             q_lora_rank=self.q_lora_rank,
             kv_lora_rank=self.kv_lora_rank,
@@ -806,6 +806,12 @@ class MLA(nn.Module):
                                    keepdim=True)[0]
             # [cp_size, num_tokens, num_heads_tp_cp]
             corrected_max = gathered_stats[..., 0] - global_max
+            # TODO we need to apply the right scaling here until tllm-gen kernels
+            # are updated to output the correct softmax stats
+            max_scale = 1.0 / (
+                self.q_scaling *
+                math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim))
+            corrected_max = corrected_max * max_scale
             corrected_max_exp = torch.exp(corrected_max)
             corrected_sum = gathered_stats[..., 1] * corrected_max_exp
             # [cp_size, num_tokens, num_heads_tp_cp] -> [1, num_tokens, num_heads_tp_cp]

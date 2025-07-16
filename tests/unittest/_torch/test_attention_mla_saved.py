@@ -748,12 +748,15 @@ def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
             else:
                 # over-write KV cache values
                 # torch.save(kv_cache_manager.get_buffers(0), "kv_mla_test.pt")
-                # kv_cache0 = torch.load("kv_mla_test.pt", map_location=device)
-                # attn_metadata.kv_cache_manager.get_buffers(0).copy_(kv_cache0)
+                kv_cache0 = torch.load("kv_0.pt", map_location=device)
+                attn_metadata.kv_cache_manager.get_buffers(0).copy_(kv_cache0)
                 # attn_metadata.kv_cache_manager.get_buffers(0)[-1, 0, 0, 0, :].uniform_(-1, 1)
-                # for tok in range(context_sequence_lengths[0]):
-                #     block, t = divmod(tok, kv_cache_tokens_per_block)
-                #     latent_cache_ref_all_list[layer_idx][tok, :].copy_(kv_cache0[block, 0, t, 0, :])
+                for tok in range(context_sequence_lengths[0]):
+                    block, t = divmod(tok, kv_cache_tokens_per_block)
+                    kv_cache = kv_cache0[block, 0, t, 0, :]
+                    kv_cache[kv_lora_rank:].copy_(kv_cache[kv_lora_rank:].view(
+                        qk_rope_head_dim // 2, 2).t().reshape(qk_rope_head_dim))
+                    latent_cache_ref_all_list[layer_idx][tok, :].copy_(kv_cache)
                 # torch.testing.assert_close(latent_cache_ref_all_list[layer_idx], attn_metadata.kv_cache_manager.get_buffers(0).view(-1, kv_lora_rank + qk_rope_head_dim)[:context_sequence_lengths[0]], rtol=0, atol=0)
                 print(latent_cache_ref_all_list[layer_idx])
                 kv_cache_ = attn_metadata.kv_cache_manager.get_buffers(0)
@@ -774,15 +777,14 @@ def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
                 torch.testing.assert_close(
                     latent_cache_ref_all_list[layer_idx][..., :kv_lora_rank],
                     kv_cache_[:, :kv_lora_rank])
+                latent_cache_ref_pe = latent_cache_ref_all_list[layer_idx][
+                    ..., kv_lora_rank:]
+                latent_cache_ref_pe = latent_cache_ref_pe.view(
+                    -1, 2, qk_rope_head_dim // 2)
+                kv_cache_pe = kv_cache_[:, kv_lora_rank:].view(
+                    -1, qk_rope_head_dim // 2, 2)
                 torch.testing.assert_close(
-                    latent_cache_ref_all_list[layer_idx][...,
-                                                         kv_lora_rank:].view(
-                                                             -1, 2,
-                                                             qk_rope_head_dim //
-                                                             2).transpose(
-                                                                 -2, -1),
-                    kv_cache_[:, kv_lora_rank:].view(-1, qk_rope_head_dim // 2,
-                                                     2))
+                    latent_cache_ref_pe.transpose(-2, -1), kv_cache_pe)
                 torch.testing.assert_close(
                     rope_cos_sin,
                     gen_layers[layer_idx].wrapper.rotary_cos_sin[0].view(
