@@ -736,6 +736,22 @@ class MLA(nn.Module):
                       position_ids: torch.Tensor,
                       attn_metadata: AttentionMetadata, **kwargs):
         if self.mapping.has_cp_helix():
+            print(f"q: {q[:, :10]}")
+            print(f"latent cache: {kwargs['latent_cache'][:, :10]}")
+            print(f"q_pe: {kwargs['q_pe'][:, :10]}")
+            kvcache = attn_metadata.kv_cache_manager.get_buffers(0)[:, 0, :,
+                                                                    0, :]
+            cache_offsets = attn_metadata.host_kv_cache_block_offsets[0, :,
+                                                                      0, :]
+            print(f"cache_offsets: {cache_offsets}")
+            for b in range(attn_metadata.num_generations):
+                block_offsets = cache_offsets[b]
+                for tok in (0, 1, 63, 64, 511):
+                    block, t = divmod(tok, 64)
+                    block = block_offsets[block].item()
+                    print(
+                        f"kv cache seq {b} tok {tok} / {self.mapping.cp_rank}: {kvcache[block, t, :10]}"
+                    )
             # partial_o: [num_tokens, num_heads_tp * kv_lora_rank]
             # softmax_stats: [num_tokens, num_heads_tp, 2]
             softmax_stats = torch.empty(q.shape[0],
@@ -763,6 +779,9 @@ class MLA(nn.Module):
                 self.mapping.cp_group,
                 dims=[-1, 1],
                 new_dims=[0, 0],
+            )
+            print(
+                f"shapes: {partial_o.shape} -> {gathered_o.shape}, {softmax_stats.shape} -> {gathered_stats.shape}"
             )
             # all_gathered = cp_allgather([partial_o, softmax_stats],
             #                             self.mapping,
@@ -796,10 +815,27 @@ class MLA(nn.Module):
                                           kv_lora_rank) * correction
             # [cp_size, num_tokens, num_heads_tp_cp, kv_lora_rank] -> [num_tokens, num_heads_tp_cp * kv_lora_rank]
             attn_output = torch.sum(corrected_o.view(*gathered_o.shape), dim=0)
+            print(f"attn_output: {attn_output[:, :10]}")
             return attn_output.to(dtype=gathered_o.dtype)
         else:
+            print(f"q: {q[:, :10]}")
+            print(f"latent cache: {kwargs['latent_cache'][:, :10]}")
+            print(f"q_pe: {kwargs['q_pe'][:, :10]}")
+            kvcache = attn_metadata.kv_cache_manager.get_buffers(0)[:, 0, :,
+                                                                    0, :]
+            cache_offsets = attn_metadata.host_kv_cache_block_offsets[0, :,
+                                                                      0, :]
+            print(f"cache_offsets: {cache_offsets}")
+            for b in range(attn_metadata.num_generations):
+                block_offsets = cache_offsets[b]
+                for tok in (0, 1, 63, 64, 511, 512, 1023):
+                    block, t = divmod(tok, 64)
+                    block = block_offsets[block].item()
+                    print(
+                        f"kv cache seq {b} tok {tok}: {kvcache[block, t, :10]}")
             attn_output = attn_instance.forward(q, k, v, attn_metadata,
                                                 **kwargs)
+            print(f"attn_output: {attn_output[:, :10]}")
             return attn_output
 
     def create_output(self, hidden_states: torch.Tensor, num_contexts: int):
