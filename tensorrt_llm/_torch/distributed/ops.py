@@ -273,7 +273,7 @@ def alltoall(
 
     op_inputs = []
 
-    for inp, dim, new_dim in zip(inputs, dims, new_dims):
+    for inp, dim in zip(inputs, dims):
         size_per_rank, rem = divmod(inp.shape[dim], n_ranks)
         assert rem == 0, \
             f"input.shape[{dim}] must be divisible by n_ranks ({n_ranks}), but got shape {inp.shape} for rank {mapping.tp_rank}"
@@ -284,6 +284,9 @@ def alltoall(
         # `n_ranks`, all the conditions are met
         op_inputs.extend(torch.split(inp, size_per_rank, dim=dim))
 
+    # note: we need to ensure that the input tensors are contiguous to provide
+    # the right data pointers to the C++ op
+    op_inputs = [op_inp.contiguous() for op_inp in op_inputs]
     outputs = torch.ops.trtllm.alltoall(
         op_inputs,
         group,
