@@ -276,7 +276,7 @@ def alltoall(
     for inp, dim in zip(inputs, dims):
         size_per_rank, rem = divmod(inp.shape[dim], n_ranks)
         assert rem == 0, \
-            f"input.shape[{dim}] must be divisible by n_ranks ({n_ranks}), but got shape {inp.shape} for rank {mapping.tp_rank}"
+            f"input.shape[{dim}] must be divisible by n_ranks ({n_ranks}), but got shape {inp.shape}"
 
         # we split the input into n_ranks equal parts along dimension `dim`
         # note: the requirement for the C++ op is that all parts have same shape,
