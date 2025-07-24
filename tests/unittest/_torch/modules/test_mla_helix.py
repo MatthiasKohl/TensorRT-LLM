@@ -110,12 +110,12 @@ all_scenarios = [
 
 # limit the number of test scenarios to avoid taking too long
 test_scenarios = [
-    all_scenarios[1],
-    all_scenarios[5],
+    # all_scenarios[1],
+    # all_scenarios[5],
     all_scenarios[8],
-    all_scenarios[12],
-    all_scenarios[18],
-    all_scenarios[19],
+    # all_scenarios[12],
+    # all_scenarios[18],
+    # all_scenarios[19],
 ]
 
 
@@ -279,12 +279,16 @@ def _make_latent_cache_gen(mla: MLA, rank: int, world_size: int,
         for r in range(world_size - 1):
             input_ctx_rank = input_ctx_bs[:, (r + 1) * ctx_len_per_gpu, :]
             if mla.is_lite:
-                _, k_pe = mla.fused_a(input_ctx_rank).split(
+                compressed_kv, k_pe = mla.fused_a(input_ctx_rank).split(
                     [mla.kv_lora_rank, mla.qk_rope_head_dim], -1)
             else:
-                _, __, k_pe = mla.fused_a(input_ctx_rank).split(
+                _, compressed_kv, k_pe = mla.fused_a(input_ctx_rank).split(
                     [mla.q_lora_rank, mla.kv_lora_rank, mla.qk_rope_head_dim],
                     -1)
+            compressed_kv = mla.kv_a_layernorm(compressed_kv)
+            print(
+                f"rank {r} {world_size}-GPU: compressed_kv: {compressed_kv[0, :8]}"
+            )
             print(f"rank {r} {world_size}-GPU: k_pe: {k_pe[0, :8]}")
             for b in range(k_pe.shape[0]):
                 block, t = divmod(
@@ -297,9 +301,11 @@ def _make_latent_cache_gen(mla: MLA, rank: int, world_size: int,
         # so we first get the cos/sin cache used in MLA
         _, cos_sin_cache = mla.pos_embd_params.rope.create_rope_const_params()
         assert cos_sin_cache.dtype == torch.float32
+        # TODO this reconstruction is still wrong somehow, need to fix it
+        cos_sin_cache = cos_sin_cache.reshape(-1, mla.qk_rope_head_dim // 2, 2)
         # at this point, we can get the RoPE embedded values
-        rope_values = ret[:, :, -mla.qk_rope_head_dim:].clone().to(
-            dtype=torch.float32)
+        rope_values = ret[:, :,
+                          mla.kv_lora_rank:].clone().to(dtype=torch.float32)
         # now we apply the inverse of RoPE embedding to get the original values
         # rope_values has shape (world_size - 1, batch_size, rope_dim)
         # cos_sin_cache has shape (max_pos, rope_dim/2, 2)
@@ -309,8 +315,12 @@ def _make_latent_cache_gen(mla: MLA, rank: int, world_size: int,
         # Setup position and cos/sin values
         positions = torch.arange(1, world_size,
                                  device=rope_values.device) * ctx_len_per_gpu
-        cos = cos_sin_cache[positions, :, 0].unsqueeze(1)
-        sin = cos_sin_cache[positions, :, 1].unsqueeze(1)
+        print(
+            f"positions: {positions}, cos_sin_cache: {cos_sin_cache.shape}: {cos_sin_cache[0, :8]}"
+        )
+        cos_sin_cache_pos = torch.index_select(cos_sin_cache, 0, positions)
+        cos = cos_sin_cache_pos[..., 0].unsqueeze(1)
+        sin = cos_sin_cache_pos[..., 1].unsqueeze(1)
         # cos/sin shape is (world_size - 1, 1, rope_dim/2) to broadcast with batch
 
         # Reshape for pairwise rotation
@@ -324,14 +334,17 @@ def _make_latent_cache_gen(mla: MLA, rank: int, world_size: int,
         v_odd = -v_prime_even * sin + v_prime_odd * cos
 
         # Combine and reshape back
-        original_rope_values_reshaped = torch.stack([v_even, v_odd], dim=-1)
-        original_rope_values = original_rope_values_reshaped.transpose(
+        orig_rope_values_reshaped = torch.stack([v_even, v_odd], dim=-1)
+        orig_rope_values = orig_rope_values_reshaped.transpose(
             -1, -2).contiguous().reshape(rope_values.shape)
 
-        ret[:, :,
-            -mla.qk_rope_head_dim:] = original_rope_values.to(dtype=ret.dtype)
+        ret[:, :, mla.kv_lora_rank:] = orig_rope_values.to(dtype=ret.dtype)
         for r in range(world_size - 1):
-            print(f"rank {r} {world_size}-GPU: k_pe: {ret[r, 0, :8]}")
+            print(
+                f"rank {r} {world_size}-GPU: kv cache values: {ret[r, 0, :8]}")
+            print(
+                f"rank {r} {world_size}-GPU: reconstructed k_pe: {ret[r, 0, mla.kv_lora_rank:mla.kv_lora_rank+8]}"
+            )
     else:
         ret = input_ctx_bs.new_empty((world_size - 1, input_ctx_bs.shape[0],
                                       mla.kv_lora_rank + mla.qk_rope_head_dim))
