@@ -271,11 +271,9 @@ def _make_latent_cache_gen(mla: MLA, rank: int, world_size: int,
                            ctx_len_per_gpu: int, input_ctx_bs: torch.Tensor,
                            ref_attn_metadata: Optional[AttentionMetadata]):
     if rank == 0:
-        # note: we get the compressed KV values from the reference cache directly
-        # but we get the RoPE values by simply applying the fused_a Linear layer
-        # this is because we want the non-embedded RoPE values for latent_cache
-        # TODO ideally, we should get the non-embedded KV values from the reference
-        # as well, but this is not implemented yet
+        assert ref_attn_metadata is not None
+        kv_cache_block_offsets = ref_attn_metadata.host_kv_cache_block_offsets
+        kv_buffer = ref_attn_metadata.kv_cache_manager.get_buffers(0)
         ret = input_ctx_bs.new_empty((world_size - 1, input_ctx_bs.shape[0],
                                       mla.kv_lora_rank + mla.qk_rope_head_dim))
         for r in range(world_size - 1):
@@ -287,18 +285,53 @@ def _make_latent_cache_gen(mla: MLA, rank: int, world_size: int,
                 _, __, k_pe = mla.fused_a(input_ctx_rank).split(
                     [mla.q_lora_rank, mla.kv_lora_rank, mla.qk_rope_head_dim],
                     -1)
-            assert ref_attn_metadata is not None
-            compressed_kv = k_pe.new_empty((k_pe.shape[0], mla.kv_lora_rank))
+            print(f"rank {r} {world_size}-GPU: k_pe: {k_pe[0, :8]}")
             for b in range(k_pe.shape[0]):
                 block, t = divmod(
                     (r + 1) * ctx_len_per_gpu,
                     ref_attn_metadata.kv_cache_manager.tokens_per_block)
-                kv_block = ref_attn_metadata.host_kv_cache_block_offsets[
-                    0, b, 0, block].item()
-                compressed_kv[
-                    b] = ref_attn_metadata.kv_cache_manager.get_buffers(0)[
-                        kv_block, 0, t, 0, :mla.kv_lora_rank]
-            ret[r] = torch.concat([compressed_kv, k_pe], dim=-1)
+                kv_block = kv_cache_block_offsets[0, b, 0, block].item()
+                ret[r, b] = kv_buffer[kv_block, 0, t, 0, :]
+        # at this point, the RoPE values are embedded and we need to get the
+        # original values instead for the latent cache
+        # so we first get the cos/sin cache used in MLA
+        _, cos_sin_cache = mla.pos_embd_params.rope.create_rope_const_params()
+        assert cos_sin_cache.dtype == torch.float32
+        # at this point, we can get the RoPE embedded values
+        rope_values = ret[:, :, -mla.qk_rope_head_dim:].clone().to(
+            dtype=torch.float32)
+        # now we apply the inverse of RoPE embedding to get the original values
+        # rope_values has shape (world_size - 1, batch_size, rope_dim)
+        # cos_sin_cache has shape (max_pos, rope_dim/2, 2)
+        # the pos_embd_params use is_neox=False so we assume GPT-J style RoPE
+        # which pairs adjacent dimensions.
+
+        # Setup position and cos/sin values
+        positions = torch.arange(1, world_size,
+                                 device=rope_values.device) * ctx_len_per_gpu
+        cos = cos_sin_cache[positions, :, 0].unsqueeze(1)
+        sin = cos_sin_cache[positions, :, 1].unsqueeze(1)
+        # cos/sin shape is (world_size - 1, 1, rope_dim/2) to broadcast with batch
+
+        # Reshape for pairwise rotation
+        rope_values_reshaped = rope_values.reshape(
+            *rope_values.shape[:-1], 2, -1).transpose(-1, -2).contiguous()
+        v_prime_even = rope_values_reshaped[..., 0]
+        v_prime_odd = rope_values_reshaped[..., 1]
+
+        # Apply inverse rotation
+        v_even = v_prime_even * cos + v_prime_odd * sin
+        v_odd = -v_prime_even * sin + v_prime_odd * cos
+
+        # Combine and reshape back
+        original_rope_values_reshaped = torch.stack([v_even, v_odd], dim=-1)
+        original_rope_values = original_rope_values_reshaped.transpose(
+            -1, -2).contiguous().reshape(rope_values.shape)
+
+        ret[:, :,
+            -mla.qk_rope_head_dim:] = original_rope_values.to(dtype=ret.dtype)
+        for r in range(world_size - 1):
+            print(f"rank {r} {world_size}-GPU: k_pe: {ret[r, 0, :8]}")
     else:
         ret = input_ctx_bs.new_empty((world_size - 1, input_ctx_bs.shape[0],
                                       mla.kv_lora_rank + mla.qk_rope_head_dim))
