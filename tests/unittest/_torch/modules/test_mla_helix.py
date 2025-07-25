@@ -276,6 +276,19 @@ def _make_latent_cache_gen(mla: MLA, rank: int, world_size: int,
         kv_buffer = ref_attn_metadata.kv_cache_manager.get_buffers(0)
         ret = input_ctx_bs.new_empty((world_size - 1, input_ctx_bs.shape[0],
                                       mla.kv_lora_rank + mla.qk_rope_head_dim))
+        # the RoPE values in the KV cache are embedded and we need to get the
+        # original values instead for the latent cache
+        # so we first get the cos/sin cache used in MLA
+        _, cos_sin_cache = mla.pos_embd_params.rope.create_rope_const_params()
+        cos_sin_cache = cos_sin_cache.reshape(-1, mla.qk_rope_head_dim // 2, 2)
+        assert cos_sin_cache.dtype == torch.float32
+
+        def rotate_half(x):
+            """Rotates half the hidden dims of the input."""
+            x1 = x[..., :x.shape[-1] // 2]
+            x2 = x[..., x.shape[-1] // 2:]
+            return torch.cat((-x2, x1), dim=-1)
+
         for r in range(world_size - 1):
             input_ctx_rank = input_ctx_bs[:, (r + 1) * ctx_len_per_gpu, :]
             if mla.is_lite:
@@ -290,19 +303,25 @@ def _make_latent_cache_gen(mla: MLA, rank: int, world_size: int,
                 f"rank {r} {world_size}-GPU: compressed_kv: {compressed_kv[0, :8]}"
             )
             print(f"rank {r} {world_size}-GPU: k_pe: {k_pe[0, :8]}")
-            for b in range(k_pe.shape[0]):
+            cos, sin = rope_cos_sin[(r + 1) *
+                                    ctx_len_per_gpu:(r + 1) * ctx_len_per_gpu +
+                                    1].chunk(2, dim=-2)
+            k_pe_seq = k_pe.unsqueeze(-2)
+            k_pe_seq = k_pe_seq.unflatten(-1, [-1, 2]).transpose(
+                -2, -1).flatten(start_dim=-2)
+            k_pe_seq = ((k_pe_seq * cos) +
+                        (rotate_half(k_pe_seq) * sin)).to(dtype=k_pe_seq.dtype)
+            print(f"rank {r} {world_size}-GPU: k_pe_seq: {k_pe_seq[0, :8]}")
+            for b in range(input_ctx_bs.shape[0]):
                 block, t = divmod(
                     (r + 1) * ctx_len_per_gpu,
                     ref_attn_metadata.kv_cache_manager.tokens_per_block)
                 kv_block = kv_cache_block_offsets[0, b, 0, block].item()
                 ret[r, b] = kv_buffer[kv_block, 0, t, 0, :]
-        # at this point, the RoPE values are embedded and we need to get the
-        # original values instead for the latent cache
-        # so we first get the cos/sin cache used in MLA
-        _, cos_sin_cache = mla.pos_embd_params.rope.create_rope_const_params()
-        assert cos_sin_cache.dtype == torch.float32
+            print(
+                f"rank {r} {world_size}-GPU: kv cache pe values: {ret[r, 0, mla.kv_lora_rank:mla.kv_lora_rank+8]}"
+            )
         # TODO this reconstruction is still wrong somehow, need to fix it
-        cos_sin_cache = cos_sin_cache.reshape(-1, mla.qk_rope_head_dim // 2, 2)
         # at this point, we can get the RoPE embedded values
         rope_values = ret[:, :,
                           mla.kv_lora_rank:].clone().to(dtype=torch.float32)
