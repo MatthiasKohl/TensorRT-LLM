@@ -495,19 +495,17 @@ def _run_mla_distributed(rank: int, world_size: int, scenario: Scenario,
 
     # every rank should have the same output and checks against the reference output
     atol, rtol = scenario.atol, scenario.rtol
+    mismatch_count = 0
     for ref_step in range(scenario.ref_steps):
         for b in range(scenario.batch):
-            _error_report(
+            mismatch_count += _error_report(
                 output[ref_step, b], ref_output[ref_step, b], atol, rtol,
                 f"Rank {rank} {world_size}-GPU step {ref_step}, batch {b}")
 
-    mismatch_count = _error_report(output, ref_output, atol, rtol,
-                                   f"Rank {rank} {world_size}-GPU")
     ratio_mismatch = mismatch_count / output.numel()
     print(
         f"Rank {rank} {world_size}-GPU: {mismatch_count}/{output.numel()} mismatches: {ratio_mismatch}"
     )
-
     return ratio_mismatch
 
 
