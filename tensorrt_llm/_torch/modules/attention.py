@@ -792,8 +792,8 @@ class MLA(nn.Module):
             correction = torch.unsqueeze(
                 gathered_stats[..., 1] * corrected_max_exp / global_sum, -1)
             # [cp_size, num_tokens, num_heads_tp_cp, kv_lora_rank]
-            corrected_o = gathered_o.view(*correction.shape[:-1],
-                                          kv_lora_rank) * correction
+            corrected_o = gathered_o.to(torch.float32).view(
+                *correction.shape[:-1], kv_lora_rank) * correction
             # [cp_size, num_tokens, num_heads_tp_cp, kv_lora_rank] -> [num_tokens, num_heads_tp_cp * kv_lora_rank]
             attn_output = torch.sum(corrected_o.view(*gathered_o.shape), dim=0)
             return attn_output.to(dtype=gathered_o.dtype)

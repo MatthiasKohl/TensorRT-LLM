@@ -71,8 +71,8 @@ class Scenario:
     ref_steps: int = 1
     # note: need to use fairly high tolerances because the softmax stats can lose
     # a lot of precision and we're using bf16 here
-    atol: float = 2e-1
-    rtol: float = 2e-2
+    atol: float = 1e-1
+    rtol: float = 5e-2
 
     @property
     def max_position_embeddings(self) -> int:
@@ -267,6 +267,36 @@ def _copy_to_cp(weights, param_name, dim, rank, world_size):
     weights[param_name] = weights[param_name][slices]
 
 
+def _error_report(output, ref_output, atol, rtol, prefix):
+    err = torch.abs(output - ref_output)
+    ref_abs = torch.abs(ref_output)
+    ref_abs[ref_abs == 0] = torch.finfo(ref_abs.dtype).smallest_normal
+    rel_err = err / ref_abs
+    # always print largest error and its index
+    max_err_idx = torch.unravel_index(torch.argmax(err - atol - rtol * ref_abs),
+                                      err.shape)
+    values_err = (output[max_err_idx].item(), ref_output[max_err_idx].item())
+    max_abs_err_idx = torch.unravel_index(torch.argmax(err), err.shape)
+    values_abs = (output[max_abs_err_idx].item(),
+                  ref_output[max_abs_err_idx].item())
+    max_rel_err_idx = torch.unravel_index(torch.argmax(rel_err), rel_err.shape)
+    values_rel = (output[max_rel_err_idx].item(),
+                  ref_output[max_rel_err_idx].item())
+    max_abs_err = err[max_abs_err_idx].item()
+    max_rel_err = rel_err[max_rel_err_idx].item()
+    max_err_idx = [x.item() for x in max_err_idx]
+    max_abs_err_idx = [x.item() for x in max_abs_err_idx]
+    max_rel_err_idx = [x.item() for x in max_rel_err_idx]
+    print(
+        f"{prefix}: max error index: {max_err_idx} "
+        f"(test/ref values: {values_err}), max abs error index: {max_abs_err_idx} "
+        f"(test/ref values: {values_abs}, err: {max_abs_err}), max rel error index: {max_rel_err_idx} "
+        f"(test/ref values: {values_rel}, err: {max_rel_err}), atol: {atol}, rtol: {rtol}"
+    )
+    isclose = err < atol + rtol * ref_abs
+    return (~isclose).sum().item()
+
+
 def _make_latent_cache_gen(mla: MLA, rank: int, world_size: int,
                            ctx_len_per_gpu: int, input_ctx_bs: torch.Tensor,
                            ref_attn_metadata: Optional[AttentionMetadata]):
@@ -280,7 +310,8 @@ def _make_latent_cache_gen(mla: MLA, rank: int, world_size: int,
         # original values instead for the latent cache
         # so we first get the cos/sin cache used in MLA
         _, cos_sin_cache = mla.pos_embd_params.rope.create_rope_const_params()
-        cos_sin_cache = cos_sin_cache.reshape(-1, mla.qk_rope_head_dim // 2, 2)
+        cos_sin_cache = cos_sin_cache.reshape(-1, mla.qk_rope_head_dim, 2)
+        print(f"cos_sin_cache: {cos_sin_cache.shape}: {cos_sin_cache[0, :8]}")
         assert cos_sin_cache.dtype == torch.float32
 
         def rotate_half(x):
@@ -288,6 +319,12 @@ def _make_latent_cache_gen(mla: MLA, rank: int, world_size: int,
             x1 = x[..., :x.shape[-1] // 2]
             x2 = x[..., x.shape[-1] // 2:]
             return torch.cat((-x2, x1), dim=-1)
+
+        def rotate_half_inv(x):
+            """Rotates half the hidden dims of the input."""
+            x1 = x[..., :x.shape[-1] // 2]
+            x2 = x[..., x.shape[-1] // 2:]
+            return torch.cat((x2, -x1), dim=-1)
 
         for r in range(world_size - 1):
             input_ctx_rank = input_ctx_bs[:, (r + 1) * ctx_len_per_gpu, :]
@@ -303,15 +340,19 @@ def _make_latent_cache_gen(mla: MLA, rank: int, world_size: int,
                 f"rank {r} {world_size}-GPU: compressed_kv: {compressed_kv[0, :8]}"
             )
             print(f"rank {r} {world_size}-GPU: k_pe: {k_pe[0, :8]}")
-            cos, sin = rope_cos_sin[(r + 1) *
-                                    ctx_len_per_gpu:(r + 1) * ctx_len_per_gpu +
-                                    1].chunk(2, dim=-2)
+            cos, sin = cos_sin_cache.transpose(
+                -2, -1)[(r + 1) * ctx_len_per_gpu:(r + 1) * ctx_len_per_gpu +
+                        1].chunk(2, dim=-2)
+            print(f"rank {r} {world_size}-GPU: cos: {cos[0, 0, :8]}")
+            print(f"rank {r} {world_size}-GPU: sin: {sin[0, 0, :8]}")
             k_pe_seq = k_pe.unsqueeze(-2)
             k_pe_seq = k_pe_seq.unflatten(-1, [-1, 2]).transpose(
                 -2, -1).flatten(start_dim=-2)
             k_pe_seq = ((k_pe_seq * cos) +
                         (rotate_half(k_pe_seq) * sin)).to(dtype=k_pe_seq.dtype)
-            print(f"rank {r} {world_size}-GPU: k_pe_seq: {k_pe_seq[0, :8]}")
+            k_pe_seq = k_pe_seq.view(input_ctx_bs.shape[0], 2,
+                                     -1).transpose(-2, -1).flatten(start_dim=-2)
+            print(f"rank {r} {world_size}-GPU: k_pe_seq: {k_pe_seq[0, :]}")
             for b in range(input_ctx_bs.shape[0]):
                 block, t = divmod(
                     (r + 1) * ctx_len_per_gpu,
@@ -319,7 +360,7 @@ def _make_latent_cache_gen(mla: MLA, rank: int, world_size: int,
                 kv_block = kv_cache_block_offsets[0, b, 0, block].item()
                 ret[r, b] = kv_buffer[kv_block, 0, t, 0, :]
             print(
-                f"rank {r} {world_size}-GPU: kv cache pe values: {ret[r, 0, mla.kv_lora_rank:mla.kv_lora_rank+8]}"
+                f"rank {r} {world_size}-GPU: kv cache pe values: {ret[r, 0, mla.kv_lora_rank:]}"
             )
         # TODO this reconstruction is still wrong somehow, need to fix it
         # at this point, we can get the RoPE embedded values
@@ -327,37 +368,28 @@ def _make_latent_cache_gen(mla: MLA, rank: int, world_size: int,
                           mla.kv_lora_rank:].clone().to(dtype=torch.float32)
         # now we apply the inverse of RoPE embedding to get the original values
         # rope_values has shape (world_size - 1, batch_size, rope_dim)
-        # cos_sin_cache has shape (max_pos, rope_dim/2, 2)
-        # the pos_embd_params use is_neox=False so we assume GPT-J style RoPE
-        # which pairs adjacent dimensions.
+        # cos_sin_cache has shape (max_pos, rope_dim, 2)
 
         # Setup position and cos/sin values
         positions = torch.arange(1, world_size,
                                  device=rope_values.device) * ctx_len_per_gpu
-        print(
-            f"positions: {positions}, cos_sin_cache: {cos_sin_cache.shape}: {cos_sin_cache[0, :8]}"
-        )
         cos_sin_cache_pos = torch.index_select(cos_sin_cache, 0, positions)
         cos = cos_sin_cache_pos[..., 0].unsqueeze(1)
         sin = cos_sin_cache_pos[..., 1].unsqueeze(1)
-        # cos/sin shape is (world_size - 1, 1, rope_dim/2) to broadcast with batch
+        print(f"rank {world_size-1} {world_size}-GPU: cos: {cos[0, 0, :8]}")
+        print(f"rank {world_size-1} {world_size}-GPU: sin: {sin[0, 0, :8]}")
+        # cos/sin shape is (world_size - 1, 1, rope_dim) to broadcast with batch
 
         # Reshape for pairwise rotation
-        rope_values_reshaped = rope_values.reshape(
-            *rope_values.shape[:-1], 2, -1).transpose(-1, -2).contiguous()
-        v_prime_even = rope_values_reshaped[..., 0]
-        v_prime_odd = rope_values_reshaped[..., 1]
+        rope_values_reshaped = rope_values.unflatten(-1, [-1, 2]).transpose(
+            -1, -2).flatten(start_dim=-2)
+        orig_rope_values = rope_values_reshaped * cos + rotate_half_inv(
+            rope_values_reshaped) * sin
+        orig_rope_values_reshaped = orig_rope_values.unflatten(
+            -1, [2, -1]).transpose(-2, -1).flatten(start_dim=-2)
 
-        # Apply inverse rotation
-        v_even = v_prime_even * cos + v_prime_odd * sin
-        v_odd = -v_prime_even * sin + v_prime_odd * cos
-
-        # Combine and reshape back
-        orig_rope_values_reshaped = torch.stack([v_even, v_odd], dim=-1)
-        orig_rope_values = orig_rope_values_reshaped.transpose(
-            -1, -2).contiguous().reshape(rope_values.shape)
-
-        ret[:, :, mla.kv_lora_rank:] = orig_rope_values.to(dtype=ret.dtype)
+        ret[:, :,
+            mla.kv_lora_rank:] = orig_rope_values_reshaped.to(dtype=ret.dtype)
         for r in range(world_size - 1):
             print(
                 f"rank {r} {world_size}-GPU: kv cache values: {ret[r, 0, :8]}")
@@ -498,39 +530,19 @@ def _run_mla_distributed(rank: int, world_size: int, scenario: Scenario,
 
     # every rank should have the same output and checks against the reference output
     atol, rtol = scenario.atol, scenario.rtol
-    err = torch.abs(output - ref_output)
-    ref_abs = torch.abs(ref_output)
-    ref_abs[ref_abs == 0] = torch.finfo(ref_abs.dtype).smallest_normal
-    rel_err = err / ref_abs
-    # always print largest error and its index
-    max_err_idx = torch.unravel_index(torch.argmax(err - atol - rtol * ref_abs),
-                                      err.shape)
-    values_err = (output[max_err_idx].item(), ref_output[max_err_idx].item())
-    max_abs_err_idx = torch.unravel_index(torch.argmax(err), err.shape)
-    values_abs = (output[max_abs_err_idx].item(),
-                  ref_output[max_abs_err_idx].item())
-    max_rel_err_idx = torch.unravel_index(torch.argmax(rel_err), rel_err.shape)
-    values_rel = (output[max_rel_err_idx].item(),
-                  ref_output[max_rel_err_idx].item())
-    max_abs_err = err[max_abs_err_idx].item()
-    max_rel_err = rel_err[max_rel_err_idx].item()
-    max_err_idx = [x.item() for x in max_err_idx]
-    max_abs_err_idx = [x.item() for x in max_abs_err_idx]
-    max_rel_err_idx = [x.item() for x in max_rel_err_idx]
+    for ref_step in range(scenario.ref_steps):
+        for b in range(scenario.batch):
+            _error_report(
+                output[ref_step, b], ref_output[ref_step, b], atol, rtol,
+                f"Rank {rank} {world_size}-GPU step {ref_step}, batch {b}")
+
+    mismatch_count = _error_report(output, ref_output, atol, rtol,
+                                   f"Rank {rank} {world_size}-GPU")
+    ratio_mismatch = mismatch_count / output.numel()
     print(
-        f"Rank {rank} {world_size}-GPU: max error index: {max_err_idx} "
-        f"(test/ref values: {values_err}), max abs error index: {max_abs_err_idx} "
-        f"(test/ref values: {values_abs}, err: {max_abs_err}), max rel error index: {max_rel_err_idx} "
-        f"(test/ref values: {values_rel}, err: {max_rel_err}), atol: {atol}, rtol: {rtol}"
+        f"Rank {rank} {world_size}-GPU: {mismatch_count}/{output.numel()} mismatches: {ratio_mismatch}"
     )
-    isclose = err < atol + rtol * ref_abs
-    ratio_mismatch = 0.0
-    if not isclose.all().item():
-        n_mismatch = (~isclose).sum().item()
-        ratio_mismatch = n_mismatch / output.numel()
-        print(
-            f"Rank {rank} {world_size}-GPU: {n_mismatch}/{output.numel()} mismatches: {ratio_mismatch}"
-        )
+
     return ratio_mismatch
 
 
