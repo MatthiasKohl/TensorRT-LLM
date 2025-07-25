@@ -289,14 +289,15 @@ def _error_report(output, ref_output, atol, rtol, prefix):
     max_err_idx = [x.item() for x in max_err_idx]
     max_abs_err_idx = [x.item() for x in max_abs_err_idx]
     max_rel_err_idx = [x.item() for x in max_rel_err_idx]
+    isclose = err < atol + rtol * ref_abs
+    n_error = (~isclose).sum().item()
     print(
-        f"{prefix}: max error index: {max_err_idx} "
+        f"{prefix}: {n_error} errors, max error index: {max_err_idx} "
         f"(test/ref values: {values_err}), max abs error index: {max_abs_err_idx} "
         f"(test/ref values: {values_abs}, err: {max_abs_err}), max rel error index: {max_rel_err_idx} "
         f"(test/ref values: {values_rel}, err: {max_rel_err}), atol: {atol}, rtol: {rtol}"
     )
-    isclose = err < atol + rtol * ref_abs
-    return (~isclose).sum().item()
+    return n_error
 
 
 def _make_latent_cache_gen(mla: MLA, rank: int, world_size: int,
@@ -469,7 +470,9 @@ def _run_mla_distributed(rank: int, world_size: int, scenario: Scenario,
                          input_gen,
                          attn_metadata,
                          latent_cache_gen=latent_cache_gen)
-        print(f"Rank {rank} {world_size}-GPU: result: {result[:, :8]}")
+        print(
+            f"Rank {rank} {world_size}-GPU: result: {result[0, :8]} / {result[-1, -8:]}"
+        )
         # update position_ids_gen
         position_ids_gen += 1
         if step < scenario.ref_steps:
@@ -605,7 +608,7 @@ def _full_test_multi_gpu(rank: int, world_size: int, scenario: Scenario,
             )
             ref_attn_metadata.prepare()
             result = mla(position_ids_gen, input_gen, ref_attn_metadata)
-            print(f"Ref result: {result[:, :8]}")
+            print(f"Ref result: {result[0, :8]} / {result[-1, -8:]}")
             # update position_ids_gen
             position_ids_gen += 1
             if step < scenario.ref_steps:
