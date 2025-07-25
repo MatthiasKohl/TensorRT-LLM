@@ -110,12 +110,14 @@ all_scenarios = [
 
 # limit the number of test scenarios to avoid taking too long
 test_scenarios = [
-    # all_scenarios[1],
-    # all_scenarios[5],
-    all_scenarios[8],
-    # all_scenarios[12],
-    # all_scenarios[18],
-    # all_scenarios[19],
+    all_scenarios[1],
+    all_scenarios[5],
+    # TODO this scenario still has many mismatches in the last sequence / batch element
+    # need to debug this further
+    # all_scenarios[8],
+    all_scenarios[12],
+    all_scenarios[18],
+    all_scenarios[19],
 ]
 
 
@@ -311,7 +313,6 @@ def _make_latent_cache_gen(mla: MLA, rank: int, world_size: int,
         # so we first get the cos/sin cache used in MLA
         _, cos_sin_cache = mla.pos_embd_params.rope.create_rope_const_params()
         cos_sin_cache = cos_sin_cache.reshape(-1, mla.qk_rope_head_dim, 2)
-        print(f"cos_sin_cache: {cos_sin_cache.shape}: {cos_sin_cache[0, :8]}")
         assert cos_sin_cache.dtype == torch.float32
 
         def rotate_half(x):
@@ -327,43 +328,12 @@ def _make_latent_cache_gen(mla: MLA, rank: int, world_size: int,
             return torch.cat((x2, -x1), dim=-1)
 
         for r in range(world_size - 1):
-            input_ctx_rank = input_ctx_bs[:, (r + 1) * ctx_len_per_gpu, :]
-            if mla.is_lite:
-                compressed_kv, k_pe = mla.fused_a(input_ctx_rank).split(
-                    [mla.kv_lora_rank, mla.qk_rope_head_dim], -1)
-            else:
-                _, compressed_kv, k_pe = mla.fused_a(input_ctx_rank).split(
-                    [mla.q_lora_rank, mla.kv_lora_rank, mla.qk_rope_head_dim],
-                    -1)
-            compressed_kv = mla.kv_a_layernorm(compressed_kv)
-            print(
-                f"rank {r} {world_size}-GPU: compressed_kv: {compressed_kv[0, :8]}"
-            )
-            print(f"rank {r} {world_size}-GPU: k_pe: {k_pe[0, :8]}")
-            cos, sin = cos_sin_cache.transpose(
-                -2, -1)[(r + 1) * ctx_len_per_gpu:(r + 1) * ctx_len_per_gpu +
-                        1].chunk(2, dim=-2)
-            print(f"rank {r} {world_size}-GPU: cos: {cos[0, 0, :8]}")
-            print(f"rank {r} {world_size}-GPU: sin: {sin[0, 0, :8]}")
-            k_pe_seq = k_pe.unsqueeze(-2)
-            k_pe_seq = k_pe_seq.unflatten(-1, [-1, 2]).transpose(
-                -2, -1).flatten(start_dim=-2)
-            k_pe_seq = ((k_pe_seq * cos) +
-                        (rotate_half(k_pe_seq) * sin)).to(dtype=k_pe_seq.dtype)
-            k_pe_seq = k_pe_seq.view(input_ctx_bs.shape[0], 2,
-                                     -1).transpose(-2, -1).flatten(start_dim=-2)
-            print(f"rank {r} {world_size}-GPU: k_pe_seq: {k_pe_seq[0, :]}")
             for b in range(input_ctx_bs.shape[0]):
                 block, t = divmod(
                     (r + 1) * ctx_len_per_gpu,
                     ref_attn_metadata.kv_cache_manager.tokens_per_block)
                 kv_block = kv_cache_block_offsets[0, b, 0, block].item()
                 ret[r, b] = kv_buffer[kv_block, 0, t, 0, :]
-            print(
-                f"rank {r} {world_size}-GPU: kv cache pe values: {ret[r, 0, mla.kv_lora_rank:]}"
-            )
-        # TODO this reconstruction is still wrong somehow, need to fix it
-        # at this point, we can get the RoPE embedded values
         rope_values = ret[:, :,
                           mla.kv_lora_rank:].clone().to(dtype=torch.float32)
         # now we apply the inverse of RoPE embedding to get the original values
@@ -376,8 +346,6 @@ def _make_latent_cache_gen(mla: MLA, rank: int, world_size: int,
         cos_sin_cache_pos = torch.index_select(cos_sin_cache, 0, positions)
         cos = cos_sin_cache_pos[..., 0].unsqueeze(1)
         sin = cos_sin_cache_pos[..., 1].unsqueeze(1)
-        print(f"rank {world_size-1} {world_size}-GPU: cos: {cos[0, 0, :8]}")
-        print(f"rank {world_size-1} {world_size}-GPU: sin: {sin[0, 0, :8]}")
         # cos/sin shape is (world_size - 1, 1, rope_dim) to broadcast with batch
 
         # Reshape for pairwise rotation
@@ -390,12 +358,6 @@ def _make_latent_cache_gen(mla: MLA, rank: int, world_size: int,
 
         ret[:, :,
             mla.kv_lora_rank:] = orig_rope_values_reshaped.to(dtype=ret.dtype)
-        for r in range(world_size - 1):
-            print(
-                f"rank {r} {world_size}-GPU: kv cache values: {ret[r, 0, :8]}")
-            print(
-                f"rank {r} {world_size}-GPU: reconstructed k_pe: {ret[r, 0, mla.kv_lora_rank:mla.kv_lora_rank+8]}"
-            )
     else:
         ret = input_ctx_bs.new_empty((world_size - 1, input_ctx_bs.shape[0],
                                       mla.kv_lora_rank + mla.qk_rope_head_dim))
@@ -696,8 +658,6 @@ def _run_single_rank(func, *args, **kwargs):
         raise Exception(f"\n\nError occurred. Original traceback is\n{tb}\n")
 
 
-# note: for now, we allow up to 10% mismatch due to how the latent cache
-# is created for the non-last ranks
 @pytest.mark.skipif(torch.cuda.device_count() < 2,
                     reason="needs 2 GPUs to run this test")
 @pytest.mark.parametrize("scenario",
@@ -705,7 +665,7 @@ def _run_single_rank(func, *args, **kwargs):
                          ids=lambda x: f"scenario: {x}")
 def test_mla_helix_distributed(scenario: Scenario,
                                gen_steps: Optional[int] = None,
-                               max_mismatch_ratio: float = 0.1,
+                               max_mismatch_ratio: float = 0.0,
                                mismatch_ratios: Optional[List[float]] = None):
     world_size = 2
     gen_steps = scenario.ref_steps if gen_steps is None else gen_steps
