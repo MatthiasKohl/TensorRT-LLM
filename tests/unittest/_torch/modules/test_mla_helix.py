@@ -89,6 +89,9 @@ all_scenarios = [
     Scenario(batch=1, ctx_len=32768),
     Scenario(batch=1, ctx_len=65536),
     Scenario(batch=1, ctx_len=131072),
+    Scenario(batch=1, ctx_len=262144),
+    Scenario(batch=1, ctx_len=524288),
+    Scenario(batch=1, ctx_len=1048576),
     Scenario(batch=8, ctx_len=1024),
     Scenario(batch=8, ctx_len=2048),
     Scenario(batch=8, ctx_len=4096),
@@ -114,10 +117,10 @@ test_scenarios = [
     # bad numerics especially with bf16. We ignore those tests for now.
     all_scenarios[2],
     all_scenarios[5],
-    all_scenarios[9],
     all_scenarios[12],
-    all_scenarios[18],
-    all_scenarios[19],
+    all_scenarios[15],
+    all_scenarios[21],
+    all_scenarios[22],
 ]
 
 
@@ -440,6 +443,13 @@ def _run_mla_distributed(rank: int, world_size: int, scenario: Scenario,
 
     outputs = []
     start = time.time()
+
+    # CUDA graph setup for timing
+    use_cuda_graph = gen_steps > scenario.ref_steps
+    graph = None
+    graph_output = None
+    start = time.time()
+
     for step in range(gen_steps):
         for req_id in range(scenario.batch):
             kv_cache_manager.impl.add_token(req_id)
@@ -447,38 +457,85 @@ def _run_mla_distributed(rank: int, world_size: int, scenario: Scenario,
         cached_tokens_per_seq = [
             ctx_len_per_gpu + cache_add for _ in range(scenario.batch)
         ]
-        attn_metadata = get_attention_backend("TRTLLM").Metadata(
-            seq_lens=torch.tensor([1] * scenario.batch, dtype=torch.int),
-            request_ids=list(range(scenario.batch)),
-            max_num_requests=scenario.batch,
-            num_contexts=0,
-            prompt_lens=[ctx_len_per_gpu] * scenario.batch,
-            max_num_tokens=ctx_len_per_gpu,
-            kv_cache_manager=kv_cache_manager,
-            kv_cache_params=KVCacheParams(
+        if step == 0:
+            attn_metadata = get_attention_backend("TRTLLM").Metadata(
+                seq_lens=torch.tensor([1] * scenario.batch, dtype=torch.int),
+                request_ids=list(range(scenario.batch)),
+                max_num_requests=scenario.batch,
+                num_contexts=0,
+                prompt_lens=[ctx_len_per_gpu] * scenario.batch,
+                max_num_tokens=ctx_len_per_gpu,
+                kv_cache_manager=kv_cache_manager,
+                kv_cache_params=KVCacheParams(
+                    use_cache=True,
+                    num_cached_tokens_per_seq=cached_tokens_per_seq,
+                ),
+                enable_paged_context_mla=True,
+            )
+        else:
+            attn_metadata.kv_cache_params = KVCacheParams(
                 use_cache=True,
                 num_cached_tokens_per_seq=cached_tokens_per_seq,
-            ),
-            enable_paged_context_mla=True,
-        )
+            )
         attn_metadata.prepare()
         extra_attrs["attention_metadata"] = weakref.ref(attn_metadata)
-        # note: we don't split position_ids_gen per rank because it is used for
-        # RoPE which should be applied in the same way for all ranks !
-        with model_extra_attrs(extra_attrs):
-            result = mla(position_ids_gen,
-                         input_gen,
-                         attn_metadata,
-                         latent_cache_gen=latent_cache_gen)
-        print(
-            f"Rank {rank} {world_size}-GPU: result: {result[0, :8]} / {result[-1, -8:]}"
-        )
-        # update position_ids_gen
-        position_ids_gen += 1
-        if step < scenario.ref_steps:
-            outputs.append(result)
+        if not use_cuda_graph:
+            # Original non-graph execution
+            with model_extra_attrs(extra_attrs):
+                result = mla(position_ids_gen,
+                             input_gen,
+                             attn_metadata,
+                             latent_cache_gen=latent_cache_gen)
+            if step < scenario.ref_steps:
+                outputs.append(result)
+            print(
+                f"Rank {rank} {world_size}-GPU: result: {result[0, :8]} / {result[-1, -8:]}"
+            )
+            # update position_ids_gen
+            position_ids_gen += 1
+            continue
+
+        # CUDA graph capture on first step when timing
+        if step == 0:
+            print(
+                f"Rank {rank} {world_size}-GPU: Creating CUDA graph and capturing"
+            )
+            # Create CUDA graph metadata for capture
+            attn_metadata = attn_metadata.create_cuda_graph_metadata(
+                max_batch_size=scenario.batch)
+            attn_metadata.prepare()
+            extra_attrs["attention_metadata"] = weakref.ref(attn_metadata)
+
+            # Warm-up runs before graph capture
+            for _ in range(2):
+                with model_extra_attrs(extra_attrs):
+                    result = mla(position_ids_gen,
+                                 input_gen,
+                                 attn_metadata,
+                                 latent_cache_gen=latent_cache_gen)
+
+            # Capture the graph
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                with model_extra_attrs(extra_attrs):
+                    graph_output = mla(position_ids_gen,
+                                       input_gen,
+                                       attn_metadata,
+                                       latent_cache_gen=latent_cache_gen)
+            result = graph_output
         elif step == scenario.ref_steps:
             start = time.time()
+
+        graph.replay()
+        result = graph_output
+
+        # update position_ids_gen
+        position_ids_gen += 1
+
+        # Collect outputs for reference comparison
+        if step < scenario.ref_steps:
+            outputs.append(result)
+
     end = time.time()
     if gen_steps == scenario.ref_steps:
         avg_gen_time = float('inf')
@@ -585,34 +642,79 @@ def _full_test_multi_gpu(rank: int, world_size: int, scenario: Scenario,
         mla(position_ids_ctx, input_ctx, ref_attn_metadata)
         ref_outputs = []
         start = time.time()
+
+        # CUDA graph setup for timing
+        use_cuda_graph = gen_steps > scenario.ref_steps
+        graph = None
+        graph_output = None
+
         for step in range(gen_steps):
             for req_id in range(scenario.batch):
                 ref_kv_cache_manager.impl.add_token(req_id)
-            ref_attn_metadata = get_attention_backend("TRTLLM").Metadata(
-                seq_lens=torch.tensor([1] * scenario.batch, dtype=torch.int),
-                request_ids=list(range(scenario.batch)),
-                max_num_requests=scenario.batch,
-                num_contexts=0,
-                prompt_lens=[scenario.ctx_len] * scenario.batch,
-                max_num_tokens=scenario.ctx_len,
-                kv_cache_manager=ref_kv_cache_manager,
-                kv_cache_params=KVCacheParams(
+            if step == 0:
+                ref_attn_metadata = get_attention_backend("TRTLLM").Metadata(
+                    seq_lens=torch.tensor([1] * scenario.batch,
+                                          dtype=torch.int),
+                    request_ids=list(range(scenario.batch)),
+                    max_num_requests=scenario.batch,
+                    num_contexts=0,
+                    prompt_lens=[scenario.ctx_len] * scenario.batch,
+                    max_num_tokens=scenario.ctx_len,
+                    kv_cache_manager=ref_kv_cache_manager,
+                    kv_cache_params=KVCacheParams(
+                        use_cache=True,
+                        num_cached_tokens_per_seq=[
+                            scenario.ctx_len + step
+                            for _ in range(scenario.batch)
+                        ],
+                    ),
+                    enable_paged_context_mla=True,
+                )
+            else:
+                ref_attn_metadata.kv_cache_params = KVCacheParams(
                     use_cache=True,
                     num_cached_tokens_per_seq=[
                         scenario.ctx_len + step for _ in range(scenario.batch)
                     ],
-                ),
-                enable_paged_context_mla=True,
-            )
+                )
             ref_attn_metadata.prepare()
-            result = mla(position_ids_gen, input_gen, ref_attn_metadata)
-            print(f"Ref result: {result[0, :8]} / {result[-1, -8:]}")
+
+            if not use_cuda_graph:
+                result = mla(position_ids_gen, input_gen, ref_attn_metadata)
+                if step < scenario.ref_steps:
+                    ref_outputs.append(result)
+                print(f"Ref result: {result[0, :8]} / {result[-1, -8:]}")
+                # update position_ids_gen
+                position_ids_gen += 1
+                continue
+
+            # CUDA graph capture on first step when timing
+            if step == 0:
+                print("Creating CUDA graph and capturing")
+                # Create CUDA graph metadata for capture
+                ref_attn_metadata = ref_attn_metadata.create_cuda_graph_metadata(
+                    max_batch_size=scenario.batch)
+                ref_attn_metadata.prepare()
+
+                # Warm-up runs before graph capture
+                for _ in range(2):
+                    result = mla(position_ids_gen, input_gen, ref_attn_metadata)
+
+                # Capture the graph
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    graph_output = mla(position_ids_gen, input_gen,
+                                       ref_attn_metadata)
+                result = graph_output
+            elif step == scenario.ref_steps:
+                # Start timing with CUDA graph
+                start = time.time()
+            graph.replay()
+            result = graph_output
             # update position_ids_gen
             position_ids_gen += 1
             if step < scenario.ref_steps:
                 ref_outputs.append(result)
-            elif step == scenario.ref_steps:
-                start = time.time()
         end = time.time()
         if gen_steps == scenario.ref_steps:
             avg_gen_time = float('inf')
@@ -684,7 +786,7 @@ def test_mla_helix_distributed(scenario: Scenario,
 
 
 if __name__ == "__main__":
-    for scenario in all_scenarios:
+    for scenario in all_scenarios[:11]:
         timing_steps = 256
         gen_steps = scenario.ref_steps + timing_steps
         print(f"Running scenario: {scenario} and timing {timing_steps} steps")
