@@ -87,14 +87,7 @@ class TestHelixPostProcess(unittest.TestCase):
         # Compute baseline
         expected_output = baseline(gathered_o, gathered_stats, kv_lora_rank,
                                    scale)
-        print(
-            f"ptrs: {gathered_o.data_ptr()} {gathered_stats.data_ptr()} {output.data_ptr()}, sizes: {cp_size} {num_tokens} {num_heads} {kv_lora_rank} {scale} {dtype}"
-        )
-        print(f"{output[:, :8]} / {expected_output[:, :8]}")
-        if num_heads > 1:
-            print(
-                f"{output[:, kv_lora_rank:kv_lora_rank+8]} / {expected_output[:, kv_lora_rank:kv_lora_rank+8]}"
-            )
+
         # Compare results
         torch.testing.assert_close(output,
                                    expected_output,
@@ -104,10 +97,10 @@ class TestHelixPostProcess(unittest.TestCase):
     @parameterized.expand([
         # (cp_size, num_tokens, num_heads, kv_lora_rank, scale, dtype)
         (4, 8, 2, 64, 1.0, torch.float16),
-        # (8, 16, 4, 128, 0.5, torch.float16),
-        # (16, 32, 8, 256, 2.0, torch.float16),
-        # (4, 8, 2, 64, 1.0, torch.bfloat16),
-        # (8, 16, 4, 128, 0.5, torch.bfloat16),
+        (8, 16, 4, 128, 0.5, torch.float16),
+        (16, 32, 8, 256, 2.0, torch.float16),
+        (4, 8, 2, 64, 1.0, torch.bfloat16),
+        (8, 16, 4, 128, 0.5, torch.bfloat16),
         (16, 32, 8, 256, 2.0, torch.bfloat16),
     ])
     def test_helix_postprocess_basic(self, cp_size, num_tokens, num_heads,
@@ -138,11 +131,19 @@ class TestHelixPostProcess(unittest.TestCase):
         gathered_o = torch.randn(4, 8, 128, dtype=torch.float16, device=device)
         gathered_stats = torch.randn(4,
                                      8,
-                                     2,
+                                     3,
                                      2,
                                      dtype=torch.float32,
                                      device=device)
 
+        with pytest.raises(RuntimeError):
+            torch.ops.trtllm.helix_post_process(gathered_o, gathered_stats, 1.0)
+        gathered_stats = torch.randn(4,
+                                     8,
+                                     2,
+                                     1,
+                                     dtype=torch.float32,
+                                     device=device)
         with pytest.raises(RuntimeError):
             torch.ops.trtllm.helix_post_process(gathered_o, gathered_stats, 1.0)
 
