@@ -17,6 +17,7 @@
 #include "tensorrt_llm/kernels/helixKernels.h"
 
 #include <cstdint>
+#include <cstdio>
 
 #include <cooperative_groups.h>
 #include <cuda_bf16.h>
@@ -102,11 +103,11 @@ static constexpr int FB_NUM_PRE_LOAD = 8;
 // output: [num_tokens, num_heads * kv_lora_rank] (half)
 // gathered_o: [cp_size, num_tokens, num_heads * kv_lora_rank] (half)
 // gathered_stats: [cp_size, num_tokens, num_heads, 2] (fp32)
-// note: we remove restrict from gathered_o to avoid compiler hoisting the barrier
-// above loads of gathered_o
+// note: we explicitly avoid using restrict here, to avoid getting ld.global.nc
+// which may have longer latency
 template <typename T>
-__global__ void helix_postprocess_kernel_fallback(T* __restrict__ output, T const* /*__restrict__*/ gathered_o,
-    float2 const* __restrict__ gathered_stats, int cp_size, int kv_lora_rank, float scale)
+__global__ void helix_postprocess_kernel_fallback(
+    T* output, T const* gathered_o, float2 const* gathered_stats, int cp_size, int kv_lora_rank, float scale)
 {
     // Each block processes one (token, head)
     // gridDim.x: num_tokens, gridDim.y: num_heads
@@ -237,10 +238,11 @@ static constexpr int MAX_VAL_PER_THREAD = 4;
 // output: [num_tokens, num_heads * kv_lora_rank] (half)
 // gathered_o: [cp_size, num_tokens, num_heads * kv_lora_rank] (half)
 // gathered_stats: [cp_size, num_tokens, num_heads, 2] (fp32)
+// note: we explicitly avoid using restrict here, to avoid getting ld.global.nc
+// which may have longer latency
 template <typename T>
-__global__ void helix_postprocess_kernel(T* __restrict__ output, T const* __restrict__ gathered_o,
-    float2 const* __restrict__ gathered_stats, int cp_size, int num_tokens, int num_heads, int num_heads_per_block,
-    int kv_lora_rank, float scale)
+__global__ void helix_postprocess_kernel(T* output, T const* gathered_o, float2 const* gathered_stats, int cp_size,
+    int num_tokens, int num_heads, int num_heads_per_block, int kv_lora_rank, float scale)
 {
     // Each block processes one token, and potentially multiple heads
     // gridDim.x: num_tokens
@@ -324,6 +326,10 @@ __global__ void helix_postprocess_kernel(T* __restrict__ output, T const* __rest
                 acc += o_elem * correction;
             }
             // Store to output: [num_tokens, num_heads * kv_lora_rank]
+            if (head_idx == 1 && token_idx == 0 && v == 0)
+            {
+                printf("acc: %f\n", acc);
+            }
             int64_t out_offset
                 = int64_t(token_idx) * int64_t(num_heads * kv_lora_rank) + int64_t(head_idx * kv_lora_rank + v);
             output[out_offset] = static_cast<T>(acc);
@@ -334,6 +340,8 @@ __global__ void helix_postprocess_kernel(T* __restrict__ output, T const* __rest
 template <typename T>
 void helixPostProcess(HelixPostProcParams<T> const& params, cudaStream_t stream)
 {
+    printf("params: %p, %p, %p, %d, %d, %d, %d, %f\n", params.output, params.gathered_o, params.gathered_stats,
+        params.cp_size, params.num_tokens, params.num_heads, params.kv_lora_rank, params.scale);
     // Check that gathered_o is 16-byte aligned
     TLLM_CHECK_WITH_INFO(reinterpret_cast<uintptr_t>(params.gathered_o) % 16 == 0,
         "gathered_o must be 16-byte aligned for async memcpy");

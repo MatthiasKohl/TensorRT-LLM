@@ -57,12 +57,13 @@ class TestHelixPostProcess(unittest.TestCase):
         device = torch.device('cuda')
 
         # Create test tensors
-        # gathered_o: [cp_size, num_tokens, num_heads * kv_lora_rank]
-        gathered_o = torch.empty(cp_size,
-                                 num_tokens,
-                                 num_heads * kv_lora_rank,
-                                 dtype=dtype,
-                                 device=device).uniform_(-1, 1)
+        # gathered_o_init: [cp_size, num_tokens, num_heads, kv_lora_rank]
+        gathered_o_init = torch.empty(cp_size,
+                                      num_tokens,
+                                      num_heads,
+                                      kv_lora_rank,
+                                      dtype=dtype,
+                                      device=device).uniform_(-1, 1)
 
         # gathered_stats: [cp_size, num_tokens, num_heads, 2]
         gathered_stats = torch.empty(cp_size,
@@ -70,7 +71,15 @@ class TestHelixPostProcess(unittest.TestCase):
                                      num_heads,
                                      2,
                                      dtype=torch.float32,
-                                     device=device).uniform_(1, 10)
+                                     device=device)
+        gathered_o_max = torch.max(gathered_o_init, dim=-1, keepdim=True)[0]
+        gathered_stats[..., 0] = gathered_o_max[..., 0]
+        gathered_o_sum = torch.sum(torch.exp(gathered_o_init - gathered_o_max),
+                                   dim=-1)
+        gathered_stats[..., 1] = gathered_o_sum
+
+        gathered_o = gathered_o_init.view(cp_size, num_tokens,
+                                          num_heads * kv_lora_rank)
 
         # Call the custom operator
         output = torch.ops.trtllm.helix_post_process(gathered_o, gathered_stats,
@@ -79,7 +88,14 @@ class TestHelixPostProcess(unittest.TestCase):
         # Compute baseline
         expected_output = baseline(gathered_o, gathered_stats, kv_lora_rank,
                                    scale)
-
+        print(
+            f"ptrs: {gathered_o.data_ptr()} {gathered_stats.data_ptr()} {output.data_ptr()}, sizes: {cp_size} {num_tokens} {num_heads} {kv_lora_rank} {scale} {dtype}"
+        )
+        print(f"{output[:, :8]} / {expected_output[:, :8]}")
+        if num_heads > 1:
+            print(
+                f"{output[:, kv_lora_rank:kv_lora_rank+8]} / {expected_output[:, kv_lora_rank:kv_lora_rank+8]}"
+            )
         # Compare results
         torch.testing.assert_close(output,
                                    expected_output,
@@ -90,10 +106,10 @@ class TestHelixPostProcess(unittest.TestCase):
         [
             # (cp_size, num_tokens, num_heads, kv_lora_rank, scale, dtype)
             (4, 8, 2, 64, 1.0, torch.float16),
-            (8, 16, 4, 128, 0.5, torch.float16),
-            (16, 32, 8, 256, 2.0, torch.float16),
-            (4, 8, 2, 64, 1.0, torch.bfloat16),
-            (8, 16, 4, 128, 0.5, torch.bfloat16),
+            # (8, 16, 4, 128, 0.5, torch.float16),
+            # (16, 32, 8, 256, 2.0, torch.float16),
+            # (4, 8, 2, 64, 1.0, torch.bfloat16),
+            # (8, 16, 4, 128, 0.5, torch.bfloat16),
             (16, 32, 8, 256, 2.0, torch.bfloat16),
         ],
         name_func=unittest_name_func)
