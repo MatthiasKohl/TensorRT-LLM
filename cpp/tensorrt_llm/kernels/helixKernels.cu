@@ -360,14 +360,14 @@ void helixPostProcess(HelixPostProcParams<T> const& params, cudaStream_t stream)
     int threads = max(MIN_NUM_THREADS, MAX_NUM_THREADS / factor);
     int num_warps = threads / WARP_SIZE;
 
-    size_t shmem_size
-        = (sizeof(T) * num_warps * params.cp_size * params.kv_lora_rank + sizeof(float2) * num_warps * params.cp_size);
+    int shmem_size = (int(sizeof(T)) * num_warps * params.cp_size * params.kv_lora_rank
+        + int(sizeof(float2)) * num_warps * params.cp_size);
     use_fallback = use_fallback || max_shared_mem_per_block < shmem_size;
     if (use_fallback)
     {
         threads = WARP_SIZE + params.kv_lora_rank * sizeof(T) / 16;
         dim3 grid(params.num_tokens, params.num_heads);
-        helix_postprocess_kernel_fallback<<<grid, threads, 0, stream>>>(
+        helix_postprocess_kernel_fallback<T><<<grid, threads, 0, stream>>>(
             params.output, params.gathered_o, params.gathered_stats, params.cp_size, params.kv_lora_rank, params.scale);
         return;
     }
@@ -375,9 +375,9 @@ void helixPostProcess(HelixPostProcParams<T> const& params, cudaStream_t stream)
     {
         // Set kernel attribute for more dynamic shared memory
         TLLM_CUDA_CHECK(
-            cudaFuncSetAttribute(helix_postprocess_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_size));
+            cudaFuncSetAttribute(helix_postprocess_kernel<T>, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_size));
     }
-    helix_postprocess_kernel<<<blocks, threads, shmem_size, stream>>>(params.output, params.gathered_o,
+    helix_postprocess_kernel<T><<<blocks, threads, shmem_size, stream>>>(params.output, params.gathered_o,
         params.gathered_stats, params.cp_size, params.num_tokens, params.num_heads, params.num_heads / factor,
         params.kv_lora_rank, params.scale);
 }

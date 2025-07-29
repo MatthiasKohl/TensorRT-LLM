@@ -24,7 +24,7 @@
 namespace torch_ext
 {
 
-torch::Tensor helix_post_process(torch::Tensor const& gathered_o, torch::Tensor const& gathered_stats, float scale)
+torch::Tensor helix_post_process(torch::Tensor const& gathered_o, torch::Tensor const& gathered_stats, double scale)
 {
     CHECK_TH_CUDA(gathered_o);
     CHECK_CONTIGUOUS(gathered_o);

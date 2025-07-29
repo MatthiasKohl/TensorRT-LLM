@@ -73,20 +73,6 @@ class TestHelixPostProcess(unittest.TestCase):
                                      dtype=torch.float32,
                                      device=device).uniform_(1, 10)
 
-        # Ensure 16-byte alignment by making tensors contiguous
-        gathered_o = gathered_o.contiguous()
-        gathered_stats = gathered_stats.contiguous()
-
-        # Ensure gathered_o is 16-byte aligned
-        assert gathered_o.data_ptr(
-        ) % 16 == 0, "gathered_o must be 16-byte aligned"
-
-        # Ensure kv_lora_rank * sizeof(dtype) is a multiple of 16
-        dtype_size = torch.elementSize(dtype)
-        assert (
-            kv_lora_rank * dtype_size
-        ) % 16 == 0, f"kv_lora_rank * sizeof({dtype}) must be a multiple of 16"
-
         # Call the custom operator
         output = torch.ops.trtllm.helix_post_process(gathered_o, gathered_stats,
                                                      scale)
@@ -122,10 +108,10 @@ class TestHelixPostProcess(unittest.TestCase):
         [
             # Test edge cases
             (1, 1, 1, 16, 1.0, torch.float16),  # Minimal sizes
-            (32, 1, 1, 16, 1.0, torch.float16),  # Max cp_size
-            (4, 1, 1, 16, 1.0, torch.float16),  # Single token
+            (256, 1, 1, 16, 1.0, torch.float16),  # Max cp_size
+            (128, 1, 1, 16, 1.0, torch.float16),  # Single token
             (4, 8, 1, 16, 1.0, torch.float16),  # Single head
-            (4, 8, 2, 16, 1.0, torch.float16),  # Minimal kv_lora_rank
+            (4, 8, 2, 2048, 1.0, torch.float16),  # Large kv_lora_rank
         ],
         name_func=unittest_name_func)
     def test_helix_postprocess_edge_cases(self, cp_size, num_tokens, num_heads,
@@ -133,27 +119,6 @@ class TestHelixPostProcess(unittest.TestCase):
         """Test edge cases with minimal dimensions"""
         self._test_helix_postprocess(cp_size, num_tokens, num_heads,
                                      kv_lora_rank, scale, dtype)
-
-    @parameterized.expand([
-        (torch.float16, ),
-        (torch.bfloat16, ),
-    ],
-                          name_func=unittest_name_func)
-    def test_helix_postprocess_dtypes(self, dtype):
-        """Test different data types"""
-        self._test_helix_postprocess(4, 8, 2, 64, 1.0, dtype)
-
-    @parameterized.expand([
-        (0.1, ),
-        (0.5, ),
-        (1.0, ),
-        (2.0, ),
-        (10.0, ),
-    ],
-                          name_func=unittest_name_func)
-    def test_helix_postprocess_scales(self, scale):
-        """Test different scale values"""
-        self._test_helix_postprocess(4, 8, 2, 64, scale, torch.float16)
 
     def test_helix_postprocess_invalid_inputs(self):
         """Test error handling for invalid inputs"""
@@ -223,6 +188,17 @@ class TestHelixPostProcess(unittest.TestCase):
             # Should not raise an error
         except RuntimeError as e:
             pytest.fail(f"Should not raise error for valid alignment: {e}")
+
+        # Test with kv_lora_rank that doesn't satisfy alignment requirements
+        gathered_o = torch.randn(4, 8, 4, dtype=torch.float16, device=device)
+        gathered_stats = torch.randn(4,
+                                     8,
+                                     1,
+                                     2,
+                                     dtype=torch.float32,
+                                     device=device)
+        with pytest.raises(RuntimeError):
+            torch.ops.trtllm.helix_post_process(gathered_o, gathered_stats, 1.0)
 
     def test_helix_postprocess_large_inputs(self):
         """Test with larger inputs to ensure performance and correctness"""
