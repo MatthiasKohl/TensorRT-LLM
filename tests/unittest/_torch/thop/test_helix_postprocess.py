@@ -59,19 +59,19 @@ class TestHelixPostProcess(unittest.TestCase):
 
         # Create test tensors
         # gathered_o: [cp_size, num_tokens, num_heads * kv_lora_rank]
-        gathered_o = torch.randn(cp_size,
+        gathered_o = torch.empty(cp_size,
                                  num_tokens,
                                  num_heads * kv_lora_rank,
                                  dtype=dtype,
-                                 device=device)
+                                 device=device).uniform_(-1, 1)
 
         # gathered_stats: [cp_size, num_tokens, num_heads, 2]
-        gathered_stats = torch.randn(cp_size,
+        gathered_stats = torch.empty(cp_size,
                                      num_tokens,
                                      num_heads,
                                      2,
                                      dtype=torch.float32,
-                                     device=device)
+                                     device=device).uniform_(1, 10)
 
         # Ensure 16-byte alignment by making tensors contiguous
         gathered_o = gathered_o.contiguous()

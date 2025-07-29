@@ -18,11 +18,14 @@
 
 #include <cstdint>
 
+#include <cooperative_groups.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 using namespace tensorrt_llm::common;
+
+namespace cg = cooperative_groups;
 
 namespace tensorrt_llm
 {
