@@ -18,7 +18,6 @@ import unittest
 import pytest
 import torch
 from parameterized import parameterized
-from utils.util import unittest_name_func
 
 import tensorrt_llm
 
@@ -102,33 +101,29 @@ class TestHelixPostProcess(unittest.TestCase):
                                    atol=1e-3,
                                    rtol=1e-2)
 
-    @parameterized.expand(
-        [
-            # (cp_size, num_tokens, num_heads, kv_lora_rank, scale, dtype)
-            (4, 8, 2, 64, 1.0, torch.float16),
-            # (8, 16, 4, 128, 0.5, torch.float16),
-            # (16, 32, 8, 256, 2.0, torch.float16),
-            # (4, 8, 2, 64, 1.0, torch.bfloat16),
-            # (8, 16, 4, 128, 0.5, torch.bfloat16),
-            (16, 32, 8, 256, 2.0, torch.bfloat16),
-        ],
-        name_func=unittest_name_func)
+    @parameterized.expand([
+        # (cp_size, num_tokens, num_heads, kv_lora_rank, scale, dtype)
+        (4, 8, 2, 64, 1.0, torch.float16),
+        # (8, 16, 4, 128, 0.5, torch.float16),
+        # (16, 32, 8, 256, 2.0, torch.float16),
+        # (4, 8, 2, 64, 1.0, torch.bfloat16),
+        # (8, 16, 4, 128, 0.5, torch.bfloat16),
+        (16, 32, 8, 256, 2.0, torch.bfloat16),
+    ])
     def test_helix_postprocess_basic(self, cp_size, num_tokens, num_heads,
                                      kv_lora_rank, scale, dtype):
         """Test basic helix postprocessing functionality"""
         self._test_helix_postprocess(cp_size, num_tokens, num_heads,
                                      kv_lora_rank, scale, dtype)
 
-    @parameterized.expand(
-        [
-            # Test edge cases
-            (1, 1, 1, 16, 1.0, torch.float16),  # Minimal sizes
-            (256, 1, 1, 16, 1.0, torch.float16),  # Max cp_size
-            (128, 1, 1, 16, 1.0, torch.float16),  # Single token
-            (4, 8, 1, 16, 1.0, torch.float16),  # Single head
-            (4, 8, 2, 2048, 1.0, torch.float16),  # Large kv_lora_rank
-        ],
-        name_func=unittest_name_func)
+    @parameterized.expand([
+        # Test edge cases
+        (1, 1, 1, 16, 1.0, torch.float16),  # Minimal sizes
+        (256, 1, 1, 16, 1.0, torch.float16),  # Max cp_size
+        (128, 1, 1, 16, 1.0, torch.float16),  # Single token
+        (4, 8, 1, 16, 1.0, torch.float16),  # Single head
+        (4, 8, 2, 2048, 1.0, torch.float16),  # Large kv_lora_rank
+    ])
     def test_helix_postprocess_edge_cases(self, cp_size, num_tokens, num_heads,
                                           kv_lora_rank, scale, dtype):
         """Test edge cases with minimal dimensions"""

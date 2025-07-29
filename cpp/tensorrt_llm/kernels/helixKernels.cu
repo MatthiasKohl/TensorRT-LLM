@@ -248,6 +248,9 @@ template <typename T>
 __global__ void helix_postprocess_kernel(T* output, T const* gathered_o, float2 const* gathered_stats, int cp_size,
     int num_tokens, int num_heads, int num_heads_per_block, int kv_lora_rank, float scale)
 {
+    printf("helix_postprocess_kernel: %d, %d, %d, %p, %p, %p, %d, %d, %d, %d, %f\n", blockIdx.x, blockIdx.y,
+        threadIdx.x, output, gathered_o, gathered_stats, cp_size, num_tokens, num_heads, num_heads_per_block,
+        kv_lora_rank, scale);
     // Each block processes one token, and potentially multiple heads
     // gridDim.x: num_tokens
     // each warp processes one head at a time
@@ -330,9 +333,9 @@ __global__ void helix_postprocess_kernel(T* output, T const* gathered_o, float2 
                 acc += o_elem * correction;
             }
             // Store to output: [num_tokens, num_heads * kv_lora_rank]
-            if (head_idx == 1 && token_idx == 0 && v == 0)
+            if (token_idx == 0 && threadIdx.x < WARP_SIZE)
             {
-                printf("acc: %f\n", acc);
+                printf("%d %d acc: %f\n", head_idx, threadIdx.x, acc);
             }
             int64_t out_offset
                 = int64_t(token_idx) * int64_t(num_heads * kv_lora_rank) + int64_t(head_idx * kv_lora_rank + v);
@@ -394,6 +397,7 @@ void helixPostProcess(HelixPostProcParams<T> const& params, cudaStream_t stream)
     helix_postprocess_kernel<T><<<blocks, threads, shmem_size, stream>>>(params.output, params.gathered_o,
         params.gathered_stats, params.cp_size, params.num_tokens, params.num_heads, params.num_heads / factor,
         params.kv_lora_rank, params.scale);
+    TLLM_CUDA_CHECK(cudaGetLastError());
 }
 
 #define INSTANTIATE_POST_PROC(T)                                                                                       \
