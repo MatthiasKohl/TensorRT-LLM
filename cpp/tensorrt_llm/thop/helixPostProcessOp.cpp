@@ -94,7 +94,7 @@ torch::Tensor helix_post_process(torch::Tensor const& gathered_o, torch::Tensor 
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
-    m.def("helix_post_process", helix_post_process);
+    m.def("helix_post_process(Tensor gathered_o, Tensor gathered_stats, float scale) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

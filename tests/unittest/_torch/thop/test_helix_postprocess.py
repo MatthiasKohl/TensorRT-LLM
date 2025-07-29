@@ -40,9 +40,8 @@ def baseline(gathered_o, gathered_stats, kv_lora_rank, scale):
                                                         kv_lora_rank)
     corrected_o = gathered_o_fp32 * correction
     # [num_tokens, num_heads * kv_lora_rank] (bf16)
-    attn_output = corrected_o.view(*gathered_o.shape[:-2],
-                                   -1).sum(dim=0).to(torch.bfloat16)
-    return attn_output
+    corrected_o = corrected_o.view(*gathered_o.shape[:-1], -1).sum(dim=0)
+    return corrected_o.to(gathered_o.dtype)
 
 
 class TestHelixPostProcess(unittest.TestCase):
