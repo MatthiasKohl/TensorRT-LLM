@@ -223,6 +223,10 @@ __global__ void helix_postprocess_kernel_fallback(
         {
             output_typed[o_idx] = static_cast<T>(final_sum[o_idx]);
         }
+        if (head_idx == 1 && tok_idx == 0 && threadIdx.x == WARP_SIZE)
+        {
+            printf("final_sum: %f\n", final_sum[0]);
+        }
         auto* output_off = output + tok_idx * num_heads * kv_lora_rank + head_idx * kv_lora_rank;
         output_off += (threadIdx.x - WARP_SIZE) * NUM_O_PER_THREAD;
         *reinterpret_cast<float4*>(output_off) = *reinterpret_cast<float4*>(output_typed);
@@ -351,7 +355,8 @@ void helixPostProcess(HelixPostProcParams<T> const& params, cudaStream_t stream)
     // Check that cp_size is not larger than the max fallback CP size
     TLLM_CHECK_WITH_INFO(params.cp_size <= FB_MAX_CP, "cp_size > fallback max CP size");
     // If the number of tokens and heads is large enough, we always use the fallback
-    bool use_fallback = params.num_tokens * params.num_heads > 256;
+    bool use_fallback = params.num_tokens * params.num_heads >= 256;
+    printf("use_fallback: %d\n", use_fallback);
     int device, max_shared_mem_per_block, n_sms;
     TLLM_CUDA_CHECK(cudaGetDevice(&device));
     TLLM_CUDA_CHECK(cudaDeviceGetAttribute(&max_shared_mem_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
@@ -371,6 +376,7 @@ void helixPostProcess(HelixPostProcParams<T> const& params, cudaStream_t stream)
     int shmem_size = (int(sizeof(T)) * num_warps * params.cp_size * params.kv_lora_rank
         + int(sizeof(float2)) * num_warps * params.cp_size);
     use_fallback = use_fallback || max_shared_mem_per_block < shmem_size;
+    printf("use_fallback: %d\n", use_fallback);
     if (use_fallback)
     {
         threads = WARP_SIZE + params.kv_lora_rank * sizeof(T) / 16;
