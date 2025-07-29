@@ -192,7 +192,7 @@ __global__ void helix_postprocess_kernel_fallback(T* __restrict__ output, T cons
 #pragma unroll
                 for (int o_idx = 0; o_idx < NUM_O_PER_THREAD; ++o_idx)
                 {
-                    final_sum[o_idx] += __bfloat162float(vals[cp_idx][o_idx]) * corr_vals[cp_idx];
+                    final_sum[o_idx] += static_cast<float>(vals[cp_idx][o_idx]) * corr_vals[cp_idx];
                 }
             }
 #pragma unroll
@@ -210,14 +210,14 @@ __global__ void helix_postprocess_kernel_fallback(T* __restrict__ output, T cons
 #pragma unroll
             for (int o_idx = 0; o_idx < NUM_O_PER_THREAD; ++o_idx)
             {
-                final_sum[o_idx] += __bfloat162float(vals[cp_idx][o_idx]) * corr_vals[cp_idx];
+                final_sum[o_idx] += static_cast<float>(vals[cp_idx][o_idx]) * corr_vals[cp_idx];
             }
         }
         T output_typed[NUM_O_PER_THREAD];
 #pragma unroll
         for (int o_idx = 0; o_idx < NUM_O_PER_THREAD; ++o_idx)
         {
-            output_typed[o_idx] = __float2bfloat16(final_sum[o_idx]);
+            output_typed[o_idx] = static_cast<T>(final_sum[o_idx]);
         }
         auto* output_off = output + tok_idx * num_heads * kv_lora_rank + head_idx * kv_lora_rank;
         output_off += (threadIdx.x - WARP_SIZE) * NUM_O_PER_THREAD;
@@ -316,13 +316,14 @@ __global__ void helix_postprocess_kernel(T* __restrict__ output, T const* __rest
                 // correction = corrected_max_exp / global_sum
                 float correction = __shfl_sync(0xffffffff, corrected_values[cp_idx / WARP_SIZE], cp_idx % WARP_SIZE);
                 // Use shared memory data instead of global memory
-                float o_elem = __bfloat162float(smem_o[warp_idx * cp_size * kv_lora_rank + cp_idx * kv_lora_rank + v]);
+                float o_elem
+                    = static_cast<float>(smem_o[warp_idx * cp_size * kv_lora_rank + cp_idx * kv_lora_rank + v]);
                 acc += o_elem * correction;
             }
             // Store to output: [num_tokens, num_heads * kv_lora_rank]
             int64_t out_offset
                 = int64_t(token_idx) * int64_t(num_heads * kv_lora_rank) + int64_t(head_idx * kv_lora_rank + v);
-            output[out_offset] = __float2bfloat16(acc);
+            output[out_offset] = static_cast<T>(acc);
         }
     }
 }
