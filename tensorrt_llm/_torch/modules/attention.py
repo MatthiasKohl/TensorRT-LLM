@@ -764,39 +764,14 @@ class MLA(nn.Module):
                 dims=[-1, 1],
                 new_dims=[0, 0],
             )
-            # all_gathered = cp_allgather([partial_o, softmax_stats],
-            #                             self.mapping,
-            #                             dim=0)
-            # # [num_tokens, num_heads_tp_cp * v_head_dim] -> [cp_size, num_tokens, num_heads_tp_cp * v_head_dim]
-            # gathered_o = all_gathered[0].view(self.mapping.cp_size,
-            #                                   *partial_o.shape)
-            # # [num_tokens, num_heads_tp_cp, 2] -> [cp_size, num_tokens, num_heads_tp_cp, 2]
-            # gathered_stats = all_gathered[1].view(self.mapping.cp_size,
-            #                                       *softmax_stats.shape)
-            # [cp_size, num_tokens, num_heads_tp_cp] -> [1, num_tokens, num_heads_tp_cp]
-            global_max = torch.max(gathered_stats[..., 0], dim=0,
-                                   keepdim=True)[0]
-            # [cp_size, num_tokens, num_heads_tp_cp]
-            corrected_max = gathered_stats[..., 0] - global_max
             # TODO we need to apply the right scaling here until tllm-gen kernels
             # are updated to output the correct softmax stats
             max_scale = 1.0 / (
                 self.q_scaling *
                 math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim))
-            corrected_max = corrected_max * max_scale
-            corrected_max_exp = torch.exp(corrected_max)
-            corrected_sum = gathered_stats[..., 1] * corrected_max_exp
-            # [cp_size, num_tokens, num_heads_tp_cp] -> [1, num_tokens, num_heads_tp_cp]
-            global_sum = torch.sum(corrected_sum, dim=0, keepdim=True)
-            # [cp_size, num_tokens, num_heads_tp_cp] -> [cp_size, num_tokens, num_heads_tp_cp, 1]
-            correction = torch.unsqueeze(
-                gathered_stats[..., 1] * corrected_max_exp / global_sum, -1)
-            # [cp_size, num_tokens, num_heads_tp_cp, kv_lora_rank]
-            corrected_o = gathered_o.to(torch.float32).view(
-                *correction.shape[:-1], kv_lora_rank) * correction
-            # [cp_size, num_tokens, num_heads_tp_cp, kv_lora_rank] -> [num_tokens, num_heads_tp_cp * kv_lora_rank]
-            attn_output = torch.sum(corrected_o.view(*gathered_o.shape), dim=0)
-            return attn_output.to(dtype=gathered_o.dtype)
+            return torch.ops.trtllm.helix_post_process(gathered_o,
+                                                       gathered_stats,
+                                                       max_scale)
         else:
             attn_output = attn_instance.forward(q, k, v, attn_metadata,
                                                 **kwargs)

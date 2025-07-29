@@ -565,3 +565,7 @@ def _register_fake():
         assert len(input_list) == len(group)
 
         return [i.new_empty(i.shape) for i in input_list]
+
+    @torch.library.register_fake("trtllm::helix_post_process")
+    def _(gathered_o, gathered_stats, scale):
+        return gathered_o.new_empty(*gathered_o.shape[1:])
