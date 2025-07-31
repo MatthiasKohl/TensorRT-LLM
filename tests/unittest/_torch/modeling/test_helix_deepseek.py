@@ -10,8 +10,9 @@ from typing import Optional
 
 import cloudpickle
 import torch
+from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor
-from transformers import PreTrainedConfig
+from transformers import PretrainedConfig
 
 import tensorrt_llm
 from tensorrt_llm._torch.attention_backend.interface import KVCacheParams
@@ -40,6 +41,7 @@ MPI.pickle.__init__(
 # values for deepseek_v3_lite
 @dataclass(kw_only=True, frozen=True)
 class Scenario:
+    # model config parameters
     dtype: torch.dtype = torch.bfloat16
     kv_cache_dtype: torch.dtype = torch.bfloat16
     num_layers: int = 1
@@ -61,33 +63,54 @@ class Scenario:
     rope_original_max_position_embeddings: int = 4096
     rope_type: str = "yarn"
     model_type: str = "deepseek_v3"
+    intermediate_size: int = 12288
+    moe_intermediate_size: int = 1536
+    n_routed_experts: int = 72
+    n_shared_experts: int = 2
+    num_experts_per_tok: int = 6
+    # set this to 1 to get a dense layer instead of MoE
+    first_k_dense_replace: int = 0
+    moe_layer_freq: int = 1
+    n_group: int = 1
+    topk_group: int = 1
+    routed_scaling_factor: float = 2.0
+    rms_norm_eps: float = 1e-6
+    vocab_size: int = 129280
+    bias: bool = False
+    num_hidden_layers: int = 1
+    # test setup parameters
     kv_cache_tokens_per_block: int = 64
     # TODO only 1 is supported for now here
     predicted_tokens_per_seq: int = 1
-    bias: bool = False
     batch: int = 8
     ctx_len: int = 1024
     # note: this is essentially the warm-up steps, as there is no correctness check for now
     ref_steps: int = 1
-    # Additional parameters needed for DeepseekV3DecoderLayer
-    intermediate_size: int = 6912
-    moe_intermediate_size: int = 6912
-    n_routed_experts: int = 8
-    n_shared_experts: int = 1
-    num_experts_per_tok: int = 2
-    first_k_dense_replace: int = 0
-    moe_layer_freq: int = 1
-    n_group: int = 4
-    topk_group: int = 2
-    routed_scaling_factor: float = 1.0
-    rms_norm_eps: float = 1e-5
-    vocab_size: int = 32000
-    num_hidden_layers: int = 1
+    world_size: int = 2
 
     @property
     def max_position_embeddings(self) -> int:
         # ensure that max_position_embeddings is set large enough for every scenario
         return self.ctx_len + 1
+
+
+@dataclass(kw_only=True, frozen=True)
+class ScenarioV3(Scenario):
+    num_heads: int = 128
+    num_kv_heads: int = 128
+    q_lora_rank: int = 1536
+    hidden_size: int = 7168
+    # this enables RoPE scaling with all the right factors (from defaults)
+    rope_scaling: bool = True
+    intermediate_size: int = 18432
+    moe_intermediate_size: int = 2048
+    n_routed_experts: int = 256
+    n_shared_experts: int = 1
+    num_experts_per_tok: int = 8
+    n_group: int = 8
+    topk_group: int = 4
+    routed_scaling_factor: float = 2.5
+    rms_norm_eps: float = 1e-6
 
 
 all_scenarios = [
@@ -120,26 +143,6 @@ all_scenarios = [
     # this goes OOM
     # Scenario(batch=16, ctx_len=131072),
 ]
-
-
-# default values from deepseek_v3, but will be overwritten by scenario
-@dataclass(kw_only=True, frozen=True)
-class RopeConfig:
-    hidden_size: int = 7168
-    num_attention_heads: int = 128
-    rope_scaling: dict = {
-        "beta_fast": 32,
-        "beta_slow": 1,
-        "factor": 40.0,
-        "mscale": 1.0,
-        "mscale_all_dim": 1.0,
-        "original_max_position_embeddings": 4096,
-        "type": "yarn",
-    },
-    max_position_embeddings: int = 163840
-    rope_theta: float = 10000.0
-    qk_rope_head_dim: int = 64
-    model_type: str = "deepseek_v3"
 
 
 def _setup_kv_and_metadata(scenario: Scenario, mapping: Mapping,
@@ -285,47 +288,45 @@ def _generate_random_weights(layer: DeepseekV3DecoderLayer):
             # Initialize gate weights
             init_uniform(mlp.gate.weight, use_kaiming=True)
             if hasattr(mlp.gate, "e_score_correction_bias"):
-                init_uniform(mlp.gate.e_score_correction_bias)
+                init_uniform(mlp.gate.e_score_correction_bias, a=1.5, b=2.5)
 
             # Initialize experts weights
             if hasattr(mlp, "experts"):
                 experts = mlp.experts
-                if hasattr(experts, "experts"):
-                    for expert in experts.experts:
-                        if hasattr(expert, "gate_proj"):
-                            init_uniform(expert.gate_proj.weight,
-                                         use_kaiming=True)
-                            if hasattr(expert.gate_proj, "bias"):
-                                init_uniform(expert.gate_proj.bias)
-                        if hasattr(expert, "up_proj"):
-                            init_uniform(expert.up_proj.weight,
-                                         use_kaiming=True)
-                            if hasattr(expert.up_proj, "bias"):
-                                init_uniform(expert.up_proj.bias)
-                        if hasattr(expert, "down_proj"):
-                            init_uniform(expert.down_proj.weight,
-                                         use_kaiming=True)
-                            if hasattr(expert.down_proj, "bias"):
-                                init_uniform(expert.down_proj.bias)
+                init_uniform(experts.w3_w1_weight)
+                init_uniform(experts.w2_weight)
+                for name in [
+                        "fc31_dequant",
+                        "fc2_dequant",
+                        "fc2_quant",
+                        "fc31_input_dequant",
+                        "w3_w1_weight_scaling_factor",
+                        "w2_weight_scaling_factor",
+                        "fc31_act_scale",
+                        "fc2_act_scale",
+                        "fc31_weight_scale",
+                        "fc2_weight_scale",
+                        "fc31_alpha",
+                        "fc2_alpha",
+                        "w3_w1_weight_scale",
+                        "w2_weight_scale",
+                        "fc31_input_scale",
+                        "fc2_input_scale",
+                        "fc31_scale_c",
+                ]:
+                    if hasattr(experts, name):
+                        init_uniform(getattr(experts, name))
 
             # Initialize shared experts weights
             if hasattr(mlp, "shared_experts"):
                 shared_experts = mlp.shared_experts
-                if hasattr(shared_experts, "gate_proj"):
-                    init_uniform(shared_experts.gate_proj.weight,
-                                 use_kaiming=True)
-                    if hasattr(shared_experts.gate_proj, "bias"):
-                        init_uniform(shared_experts.gate_proj.bias)
-                if hasattr(shared_experts, "up_proj"):
-                    init_uniform(shared_experts.up_proj.weight,
-                                 use_kaiming=True)
-                    if hasattr(shared_experts.up_proj, "bias"):
-                        init_uniform(shared_experts.up_proj.bias)
-                if hasattr(shared_experts, "down_proj"):
-                    init_uniform(shared_experts.down_proj.weight,
-                                 use_kaiming=True)
-                    if hasattr(shared_experts.down_proj, "bias"):
-                        init_uniform(shared_experts.down_proj.bias)
+                init_uniform(shared_experts.gate_up_proj.weight,
+                             use_kaiming=True)
+                if hasattr(shared_experts.gate_up_proj, "bias"):
+                    init_uniform(shared_experts.gate_up_proj.bias)
+                init_uniform(shared_experts.down_proj.weight, use_kaiming=True)
+                if hasattr(shared_experts.down_proj, "bias"):
+                    init_uniform(shared_experts.down_proj.bias)
 
 
 def _copy_to_cp(weights, param_name, dim, rank, world_size):
@@ -349,6 +350,11 @@ def _run_ds_layer_distributed(rank: int, world_size: int, scenario: Scenario,
                             scenario.hidden_size,
                             dtype=scenario.dtype,
                             device="cuda").uniform_(-1, 1)
+    input_gen_residual = torch.empty(scenario.batch *
+                                     scenario.predicted_tokens_per_seq,
+                                     scenario.hidden_size,
+                                     dtype=scenario.dtype,
+                                     device="cuda").uniform_(-1, 1)
     position_ids_ctx = torch.arange(scenario.ctx_len,
                                     dtype=torch.int,
                                     device="cuda").repeat(scenario.batch)
@@ -359,7 +365,20 @@ def _run_ds_layer_distributed(rank: int, world_size: int, scenario: Scenario,
 
     extra_attrs = dict()
     # Set all values from scenario
-    pretrained_config = PreTrainedConfig(
+    if scenario.rope_scaling:
+        rope_scaling = {
+            "beta_fast": scenario.rope_beta_fast,
+            "beta_slow": scenario.rope_beta_slow,
+            "factor": scenario.rope_factor,
+            "mscale": scenario.rope_mscale,
+            "mscale_all_dim": scenario.rope_mscale_all_dim,
+            "original_max_position_embeddings":
+            scenario.rope_original_max_position_embeddings,
+            "type": scenario.rope_type,
+        }
+    else:
+        rope_scaling = None
+    pretrained_config = PretrainedConfig(
         hidden_size=scenario.hidden_size,
         num_attention_heads=scenario.num_heads,
         num_key_value_heads=scenario.num_kv_heads,
@@ -370,17 +389,7 @@ def _run_ds_layer_distributed(rank: int, world_size: int, scenario: Scenario,
         v_head_dim=scenario.v_head_dim,
         max_position_embeddings=scenario.max_position_embeddings,
         rope_theta=scenario.rope_theta,
-        # TODO maybe remove scaling if not wanted
-        rope_scaling={
-            "beta_fast": scenario.rope_beta_fast,
-            "beta_slow": scenario.rope_beta_slow,
-            "factor": scenario.rope_factor,
-            "mscale": scenario.rope_mscale,
-            "mscale_all_dim": scenario.rope_mscale_all_dim,
-            "original_max_position_embeddings":
-            scenario.rope_original_max_position_embeddings,
-            "type": scenario.rope_type,
-        },
+        rope_scaling=rope_scaling,
         intermediate_size=scenario.intermediate_size,
         moe_intermediate_size=scenario.moe_intermediate_size,
         n_routed_experts=scenario.n_routed_experts,
@@ -495,11 +504,11 @@ def _run_ds_layer_distributed(rank: int, world_size: int, scenario: Scenario,
         if not use_cuda_graph:
             # Original non-graph execution
             with model_extra_attrs(extra_attrs):
-                result = layer(
+                result, _ = layer(
                     position_ids=position_ids_gen,
                     hidden_states=input_gen,
                     attn_metadata=attn_metadata,
-                    residual=None,
+                    residual=input_gen_residual,
                 )
             if step < scenario.ref_steps:
                 outputs.append(result)
@@ -521,22 +530,22 @@ def _run_ds_layer_distributed(rank: int, world_size: int, scenario: Scenario,
             # Warm-up runs before graph capture
             for _ in range(2):
                 with model_extra_attrs(extra_attrs):
-                    result = layer(
+                    result, _ = layer(
                         position_ids=position_ids_gen,
                         hidden_states=input_gen,
                         attn_metadata=attn_metadata,
-                        residual=None,
+                        residual=input_gen_residual,
                     )
 
             # Capture the graph
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
                 with model_extra_attrs(extra_attrs):
-                    graph_output = layer(
+                    graph_output, _ = layer(
                         position_ids=position_ids_gen,
                         hidden_states=input_gen,
                         attn_metadata=attn_metadata,
-                        residual=None,
+                        residual=input_gen_residual,
                     )
             result = graph_output
         elif step == scenario.ref_steps:
@@ -552,6 +561,9 @@ def _run_ds_layer_distributed(rank: int, world_size: int, scenario: Scenario,
         if step < scenario.ref_steps:
             outputs.append(result)
 
+    # synchronize to ensure all graphs are done
+    torch.cuda.synchronize()
+
     end = time.time()
     if gen_steps == scenario.ref_steps:
         avg_gen_time = float('inf')
@@ -560,7 +572,7 @@ def _run_ds_layer_distributed(rank: int, world_size: int, scenario: Scenario,
     throughput = scenario.batch / avg_gen_time
     print(f"Rank {rank} {world_size}-GPU: time taken for "
           f"{gen_steps - scenario.ref_steps} steps: "
-          f"{end - start} s, throughput: {throughput} MLA/s")
+          f"{end - start} s, throughput: {throughput} DS decoder layer/s")
     output = torch.stack(outputs, dim=0)
     kv_cache_manager.shutdown()
 
