@@ -235,17 +235,19 @@ def _generate_random_weights(layer: DeepseekV3DecoderLayer):
         scale = x.abs().amax(dim=(-3, -1)) / 448.
         tensor.fill_(scale)
 
+    def init_linear(mod):
+        if mod is None:
+            return
+        init_uniform(mod.weight, use_kaiming=True)
+        if hasattr(mod, "weight_scale"):
+            init_block_scale(mod.weight_scale, mod.weight)
+        if hasattr(mod, "bias"):
+            init_uniform(mod.bias)
+
     mla = layer.self_attn
     # Linear modules
-    for name in ["fused_a", "kv_b_proj", "o_proj"]:
-        mod = getattr(mla, name, None)
-        if mod is not None:
-            init_uniform(mod.weight, use_kaiming=True)
-            if hasattr(mod, "bias"):
-                init_uniform(mod.bias)
-
-    if hasattr(mla, "v_b_proj"):
-        init_uniform(mla.v_b_proj)
+    for name in ["fused_a", "kv_b_proj", "o_proj", "q_b_proj"]:
+        init_linear(getattr(mla, name, None))
 
     # RMSNorm modules
     for name in ["kv_a_layernorm", "q_a_layernorm"]:
@@ -253,20 +255,14 @@ def _generate_random_weights(layer: DeepseekV3DecoderLayer):
         if mod is not None and hasattr(mod, "weight"):
             init_uniform(mod.weight, a=0.9, b=1.1)
 
-    # q_b_proj and q_proj (q_proj only in lite mode, aliased as q_b_proj)
-    for name in ["q_b_proj", "q_proj"]:
-        mod = getattr(mla, name, None)
-        if mod is not None:
-            init_uniform(mod.weight, use_kaiming=True)
-            if hasattr(mod, "bias"):
-                init_uniform(mod.bias)
-
     # k_b_proj_trans (created in create_weights)
     if hasattr(mla, "k_b_proj_trans"):
         init_uniform(mla.k_b_proj_trans, use_kaiming=True)
     # k_b_proj_trans_scale (optional)
     if hasattr(mla, "k_b_proj_trans_scale"):
         init_block_scale(mla.k_b_proj_trans_scale, mla.k_b_proj_trans)
+    if hasattr(mla, "v_b_proj"):
+        init_uniform(mla.v_b_proj)
     # v_b_proj_scale (optional)
     if hasattr(mla, "v_b_proj_scale"):
         init_block_scale(mla.v_b_proj_scale, mla.v_b_proj)
@@ -284,12 +280,8 @@ def _generate_random_weights(layer: DeepseekV3DecoderLayer):
         # Handle both GatedMLP and Deepseekv3MoE
         if hasattr(mlp, "gate_up_proj"):
             # GatedMLP case
-            init_uniform(mlp.gate_up_proj.weight, use_kaiming=True)
-            if hasattr(mlp.gate_up_proj, "bias"):
-                init_uniform(mlp.gate_up_proj.bias)
-            init_uniform(mlp.down_proj.weight, use_kaiming=True)
-            if hasattr(mlp.down_proj, "bias"):
-                init_uniform(mlp.down_proj.bias)
+            init_linear(mlp.gate_up_proj)
+            init_linear(mlp.down_proj)
         elif hasattr(mlp, "gate"):
             # Deepseekv3MoE case
             # Initialize gate weights
@@ -322,18 +314,25 @@ def _generate_random_weights(layer: DeepseekV3DecoderLayer):
                         "fc31_scale_c",
                 ]:
                     if hasattr(experts, name):
+                        if "weight_scal" in name and (
+                                "w3" in name or "fc31" in name) and (
+                                    not hasattr(experts, "scaling_vector_size")
+                                    or experts.scaling_vector_size == 128):
+                            init_block_scale(getattr(experts, name),
+                                             experts.w3_w1_weight)
+                        elif "weight_scale" in name and (
+                                "w2" in name or "fc2" in name) and (
+                                    not hasattr(experts, "scaling_vector_size")
+                                    or experts.scaling_vector_size == 128):
+                            init_block_scale(getattr(experts, name),
+                                             experts.w2_weight)
                         init_uniform(getattr(experts, name))
 
             # Initialize shared experts weights
             if hasattr(mlp, "shared_experts"):
                 shared_experts = mlp.shared_experts
-                init_uniform(shared_experts.gate_up_proj.weight,
-                             use_kaiming=True)
-                if hasattr(shared_experts.gate_up_proj, "bias"):
-                    init_uniform(shared_experts.gate_up_proj.bias)
-                init_uniform(shared_experts.down_proj.weight, use_kaiming=True)
-                if hasattr(shared_experts.down_proj, "bias"):
-                    init_uniform(shared_experts.down_proj.bias)
+                init_linear(shared_experts.gate_up_proj)
+                init_linear(shared_experts.down_proj)
 
 
 def _copy_to_cp(weights, param_name, dim, rank, world_size):
