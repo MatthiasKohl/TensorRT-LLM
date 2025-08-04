@@ -608,6 +608,11 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             aux_stream=aux_stream_dict[AuxStreamType.Attention])
         self.enable_attention_dp = mapping.enable_attention_dp
 
+        if mapping.has_cp_helix():
+            # after attention, Helix CP GPUs become TP GPUs
+            model_config.mapping.tp_size = mapping.tp_size * mapping.cp_size
+            model_config.mapping.cp_size = 1
+
         self.mlp_tp_size = mapping.tp_size
 
         self.fusion_config = EagerFusionConfig()

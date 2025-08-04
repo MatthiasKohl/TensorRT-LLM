@@ -78,6 +78,13 @@ class Scenario:
     vocab_size: int = 129280
     bias: bool = False
     num_hidden_layers: int = 1
+    # ensure we get DS Fp8
+    quantization_config: dict = {
+        "activation_scheme": "dynamic",
+        "fmt": "e4m3",
+        "quant_method": "fp8",
+        "weight_block_size": [128, 128]
+    }
     # test setup parameters
     kv_cache_tokens_per_block: int = 64
     # TODO only 1 is supported for now here
@@ -406,6 +413,7 @@ def _run_ds_layer_distributed(rank: int, world_size: int, scenario: Scenario,
         num_hidden_layers=scenario.num_hidden_layers,
         torch_dtype=scenario.dtype,
         model_type=scenario.model_type,
+        quantization_config=scenario.quantization_config,
     )
     # the mapping used for helix
     mapping = Mapping(world_size=world_size,
