@@ -5,7 +5,7 @@ import sys
 import time
 import traceback
 import weakref
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 import cloudpickle
@@ -36,6 +36,15 @@ MPI.pickle.__init__(
     cloudpickle.loads,
     pickle.HIGHEST_PROTOCOL,
 )
+
+# set this to ensure we get DS Fp8
+# TODO: debug this once we get access to machines
+QUANTIZATION_CONFIG = {
+    "activation_scheme": "dynamic",
+    "fmt": "e4m3",
+    "quant_method": "fp8",
+    "weight_block_size": [128, 128]
+}
 
 
 # values for deepseek_v3_lite
@@ -78,13 +87,8 @@ class Scenario:
     vocab_size: int = 129280
     bias: bool = False
     num_hidden_layers: int = 1
-    # ensure we get DS Fp8
-    quantization_config: dict = {
-        "activation_scheme": "dynamic",
-        "fmt": "e4m3",
-        "quant_method": "fp8",
-        "weight_block_size": [128, 128]
-    }
+    quantization_config: dict = field(
+        default_factory=lambda: QUANTIZATION_CONFIG)
     # test setup parameters
     kv_cache_tokens_per_block: int = 64
     # TODO only 1 is supported for now here
@@ -590,8 +594,8 @@ def _run_ds_layer_distributed(rank: int, world_size: int, scenario: Scenario,
 
 def _run_single_rank(func, *args, **kwargs):
     rank = tensorrt_llm.mpi_rank()
-    torch.cuda.set_device(rank)
     print(f"rank {rank} starting")
+    torch.cuda.set_device(rank)
     try:
         ret = func(rank, *args, **kwargs)
         print(f"rank {rank} done")
