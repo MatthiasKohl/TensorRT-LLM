@@ -1,11 +1,15 @@
 # for now, this is only used as a benchmark and not a correctness test
 
+import json
+import os
 import pickle
 import sys
+import tempfile
 import time
 import traceback
 import weakref
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Optional
 
 import cloudpickle
@@ -20,6 +24,7 @@ from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_deepseekv3 import \
     DeepseekV3DecoderLayer
+from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest,
                                                         LlmRequestState,
                                                         SamplingConfig)
@@ -220,24 +225,54 @@ def _setup_kv_and_metadata(scenario: Scenario, mapping: Mapping,
 
 
 def _generate_random_weights(layer: DeepseekV3DecoderLayer):
-    # Helper to init a tensor
+    # Helpers to init a tensor
+    def init_low_precision(t, op):
+        if t.dtype.itemsize <= 1:
+            t2 = torch.empty_like(t, dtype=torch.float32)
+            op(t2)
+            t.copy_(t2)
+        else:
+            op(t)
+
     def init_uniform(tensor, a=-1.0, b=1.0, use_kaiming=False):
         if tensor is not None:
             if use_kaiming:
                 tv = tensor.view(-1, tensor.shape[-2], tensor.shape[-1])
                 for t in tv:
-                    torch.nn.init.kaiming_uniform_(t)
+                    init_low_precision(t, torch.nn.init.kaiming_uniform_)
             else:
-                torch.nn.init.uniform_(tensor, a=a, b=b)
+                init_low_precision(tensor,
+                                   partial(torch.nn.init.uniform_, a=a, b=b))
 
     def init_block_scale(tensor, orig_tensor):
         if tensor is None or orig_tensor is None:
             return
-        x = orig_tensor.view(*orig_tensor.shape[:-2],
-                             orig_tensor.shape[-2] // 128, 128,
-                             orig_tensor.shape[-1] // 128, 128)
+        b1, b2 = 128, 128
+        orig_tensor = orig_tensor.contiguous().to(tensor.dtype)
+        e1 = orig_tensor.shape[-2] // b1
+        e2 = orig_tensor.shape[-1] // b2
+        x = orig_tensor[..., :e1 * b1, :e2 * b2].view(*orig_tensor.shape[:-2],
+                                                      e1, b1, e2, b2)
         scale = x.abs().amax(dim=(-3, -1)) / 448.
-        tensor.fill_(scale)
+        if e1 * b1 != orig_tensor.shape[-2]:
+            x2 = orig_tensor[...,
+                             e1 * b1:, :e2 * b2].view(*orig_tensor.shape[:-2],
+                                                      1, -1, e2, b2)
+            scale2 = x2.abs().amax(dim=(-3, -1)) / 448.
+            scale = torch.cat([scale, scale2], dim=-2)
+        if e2 * b2 != orig_tensor.shape[-1]:
+            x3 = orig_tensor[..., :e1 * b1,
+                             e2 * b2:].view(*orig_tensor.shape[:-2], e1, b1, 1,
+                                            -1)
+            scale3 = x3.abs().amax(dim=(-3, -1)) / 448.
+            if scale.shape[-2] == e1 + 1:
+                x4 = orig_tensor[..., e1 * b1:,
+                                 e2 * b2:].view(*orig_tensor.shape[:-2], 1, -1,
+                                                1, -1)
+                scale4 = x4.abs().amax(dim=(-3, -1)) / 448.
+                scale3 = torch.cat([scale3, scale4], dim=-2)
+            scale = torch.cat([scale, scale3], dim=-1)
+        tensor.copy_(scale)
 
     def init_linear(mod):
         if mod is None:
@@ -389,6 +424,7 @@ def _run_ds_layer_distributed(rank: int, world_size: int, scenario: Scenario,
     else:
         rope_scaling = None
     pretrained_config = PretrainedConfig(
+        architectures=["DeepseekV3ForCausalLM"],
         hidden_size=scenario.hidden_size,
         num_attention_heads=scenario.num_heads,
         num_key_value_heads=scenario.num_kv_heads,
@@ -417,24 +453,30 @@ def _run_ds_layer_distributed(rank: int, world_size: int, scenario: Scenario,
         torch_dtype=scenario.dtype,
         model_type=scenario.model_type,
         quantization_config=scenario.quantization_config,
+        use_bfloat16=scenario.dtype == torch.bfloat16,
     )
     # the mapping used for helix
     mapping = Mapping(world_size=world_size,
                       rank=rank,
                       cp_size=world_size,
                       cp_config={'cp_type': CpType.HELIX})
-    config = ModelConfig(
-        pretrained_config=pretrained_config,
-        mapping=mapping,
-        max_num_tokens=scenario.ctx_len,
-        attn_backend="TRTLLM",
-        moe_backend="TRTLLM",
-        use_cuda_graph=True,
-    )
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config_dict = pretrained_config.to_dict()
+        config_dict["model_type"] = scenario.model_type
+        with open(os.path.join(tmpdir, "config.json"), "w") as f:
+            json.dump(config_dict, f)
+        config = ModelConfig.from_pretrained(
+            checkpoint_dir=tmpdir,
+            mapping=mapping,
+            max_num_tokens=scenario.ctx_len,
+            attn_backend="TRTLLM",
+            moe_backend="TRTLLM",
+            use_cuda_graph=True,
+        )
     if rank == 0:
-        print(f"Using pre-trained config: {pretrained_config}")
-        print(f"Using mapping: {mapping}")
-        print(f"Using config: {config}")
+        print(f"Rank 0 using config: {config}")
+    else:
+        print(f"Rank {rank} using same config as rank 0")
     config.extra_attrs = extra_attrs
     aux_stream_list = [torch.cuda.Stream() for _ in range(2)]
     aux_stream_dict = {
@@ -447,6 +489,9 @@ def _run_ds_layer_distributed(rank: int, world_size: int, scenario: Scenario,
         layer_idx=0,
         aux_stream_dict=aux_stream_dict,
     ).cuda()
+    layer.next_layer_layernorm = RMSNorm(hidden_size=scenario.hidden_size,
+                                         eps=scenario.rms_norm_eps,
+                                         dtype=scenario.dtype).cuda()
     _generate_random_weights(layer)
 
     # Set up KVCacheManager and attn_metadata for distributed

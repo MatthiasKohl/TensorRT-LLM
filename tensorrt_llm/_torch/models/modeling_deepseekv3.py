@@ -600,20 +600,28 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         self.top_k = config.num_experts_per_tok
 
         self.mapping = model_config.mapping
-        mapping = self.mapping
 
         self.self_attn = DeepseekV3Attention(
             model_config,
             layer_idx=layer_idx,
             aux_stream=aux_stream_dict[AuxStreamType.Attention])
-        self.enable_attention_dp = mapping.enable_attention_dp
+        self.enable_attention_dp = self.mapping.enable_attention_dp
 
-        if mapping.has_cp_helix():
+        if self.mapping.has_cp_helix():
             # after attention, Helix CP GPUs become TP GPUs
-            model_config.mapping.tp_size = mapping.tp_size * mapping.cp_size
-            model_config.mapping.cp_size = 1
+            new_mapping = Mapping(
+                world_size=self.mapping.world_size,
+                rank=self.mapping.rank,
+                gpus_per_node=self.mapping.gpus_per_node,
+                cp_size=1,
+                cp_config=None,
+                tp_size=self.mapping.tp_size * self.mapping.cp_size,
+                pp_size=self.mapping.pp_size,
+                auto_parallel=False,
+                enable_attention_dp=self.mapping.enable_attention_dp)
+            self.mapping = new_mapping
 
-        self.mlp_tp_size = mapping.tp_size
+        self.mlp_tp_size = self.mapping.tp_size
 
         self.fusion_config = EagerFusionConfig()
         self.enable_fusion = os.environ.get(
@@ -625,7 +633,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             model_config, layer_idx)
         self.is_nvfp4 = quant_config.layer_quant_mode.has_nvfp4()
 
-        has_tp = mapping.has_tp()
+        has_tp = self.mapping.has_tp()
 
         if (config.n_routed_experts is not None
                 and layer_idx >= config.first_k_dense_replace
@@ -678,7 +686,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                                                 eps=config.rms_norm_eps,
                                                 dtype=config.torch_dtype)
         self.layer_idx = layer_idx
-        self.allreduce = AllReduce(mapping=model_config.mapping,
+        self.allreduce = AllReduce(mapping=self.mapping,
                                    strategy=model_config.allreduce_strategy,
                                    dtype=config.torch_dtype)
         self.moe_allreduce = MoEAllReduce(self.mapping)

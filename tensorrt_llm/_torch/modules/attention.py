@@ -705,7 +705,7 @@ class MLA(nn.Module):
             self.v_b_proj_scale = nn.Parameter(
                 torch.empty(
                     (
-                        self.num_heads_tp,
+                        self.num_heads_tp_cp,
                         self.v_head_dim // 128,
                         self.kv_lora_rank // 128,
                     ),
@@ -1368,7 +1368,7 @@ class MLA(nn.Module):
             # is compatible with o_proj even in the context phase,
             # thus we cut it to num_heads_tp_cp * v_head_dim
             attn_output = attn_output[:, :self.num_heads_tp_cp *
-                                      self.v_head_dim]
+                                      self.v_head_dim].contiguous()
         attn_output = self.o_proj(attn_output,
                                   all_reduce_params=all_reduce_params)
         return attn_output
