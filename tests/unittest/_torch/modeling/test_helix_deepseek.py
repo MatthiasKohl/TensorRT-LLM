@@ -431,6 +431,10 @@ def _run_ds_layer_distributed(rank: int, world_size: int, scenario: Scenario,
         moe_backend="TRTLLM",
         use_cuda_graph=True,
     )
+    if rank == 0:
+        print(f"Using pre-trained config: {pretrained_config}")
+        print(f"Using mapping: {mapping}")
+        print(f"Using config: {config}")
     config.extra_attrs = extra_attrs
     aux_stream_list = [torch.cuda.Stream() for _ in range(2)]
     aux_stream_dict = {
