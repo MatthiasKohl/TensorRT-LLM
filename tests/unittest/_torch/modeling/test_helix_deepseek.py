@@ -21,6 +21,7 @@ from transformers import PretrainedConfig
 import tensorrt_llm
 from tensorrt_llm._torch.attention_backend.interface import KVCacheParams
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+from tensorrt_llm._torch.distributed import AllReduceParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_deepseekv3 import \
     DeepseekV3DecoderLayer
@@ -249,6 +250,15 @@ def _generate_random_weights(layer: DeepseekV3DecoderLayer):
             return
         b1, b2 = 128, 128
         orig_tensor = orig_tensor.contiguous().to(tensor.dtype)
+        exp1 = (orig_tensor.shape[-2] + b1 - 1) // b1
+        exp2 = (orig_tensor.shape[-1] + b2 - 1) // b2
+        if tensor.shape[-2] != exp1 or tensor.shape[-1] != exp2:
+            # for some fused weights, this can happen
+            # we simply adapt the size of the blocks and use that for the scale
+            b1 = (orig_tensor.shape[-2] + tensor.shape[-2] -
+                  1) // tensor.shape[-2]
+            b2 = (orig_tensor.shape[-1] + tensor.shape[-1] -
+                  1) // tensor.shape[-1]
         e1 = orig_tensor.shape[-2] // b1
         e2 = orig_tensor.shape[-1] // b2
         x = orig_tensor[..., :e1 * b1, :e2 * b2].view(*orig_tensor.shape[:-2],
@@ -365,7 +375,8 @@ def _generate_random_weights(layer: DeepseekV3DecoderLayer):
                                     or experts.scaling_vector_size == 128):
                             init_block_scale(getattr(experts, name),
                                              experts.w2_weight)
-                        init_uniform(getattr(experts, name))
+                        else:
+                            init_uniform(getattr(experts, name))
 
             # Initialize shared experts weights
             if hasattr(mlp, "shared_experts"):
@@ -458,6 +469,7 @@ def _run_ds_layer_distributed(rank: int, world_size: int, scenario: Scenario,
     # the mapping used for helix
     mapping = Mapping(world_size=world_size,
                       rank=rank,
+                      moe_ep_size=(world_size + 3) // 4,
                       cp_size=world_size,
                       cp_config={'cp_type': CpType.HELIX})
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -516,11 +528,13 @@ def _run_ds_layer_distributed(rank: int, world_size: int, scenario: Scenario,
         scenario.batch * ctx_len_per_gpu).contiguous()
     # this represents the context step
     with model_extra_attrs(extra_attrs):
-        layer(
+        # note: only run the attention because MoE causes some issues with large #tokens
+        layer.self_attn(
             position_ids=position_ids_ctx_rank,
             hidden_states=input_ctx_rank,
             attn_metadata=attn_metadata,
-            residual=None,
+            all_reduce_params=AllReduceParams(
+                enable_allreduce=not (layer.disable_attn_allreduce)),
         )
 
     outputs = []
