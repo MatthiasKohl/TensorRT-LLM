@@ -19,10 +19,8 @@ from mpi4py.futures import MPIPoolExecutor
 from transformers import PretrainedConfig
 
 import tensorrt_llm
-from tensorrt_llm._torch.attention_backend.interface import (
-    AttentionRuntimeFeatures, KVCacheParams)
+from tensorrt_llm._torch.attention_backend.interface import KVCacheParams
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
-from tensorrt_llm._torch.distributed import AllReduceParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_deepseekv3 import \
     DeepseekV3DecoderLayer
@@ -132,9 +130,6 @@ class ScenarioV3(Scenario):
 
 
 all_scenarios = [
-    ScenarioV3(batch=1, ctx_len=1024),
-    ScenarioV3(batch=1, ctx_len=2048),
-    ScenarioV3(batch=1, ctx_len=4096),
     ScenarioV3(batch=1, ctx_len=8192),
     ScenarioV3(batch=1, ctx_len=16384),
     ScenarioV3(batch=1, ctx_len=32768),
@@ -143,6 +138,9 @@ all_scenarios = [
     ScenarioV3(batch=1, ctx_len=262144),
     ScenarioV3(batch=1, ctx_len=524288),
     ScenarioV3(batch=1, ctx_len=1048576),
+    ScenarioV3(batch=1, ctx_len=2097152),
+    ScenarioV3(batch=1, ctx_len=4194304),
+    ScenarioV3(batch=1, ctx_len=8388608),
     Scenario(batch=8, ctx_len=1024),
     Scenario(batch=8, ctx_len=2048),
     Scenario(batch=8, ctx_len=4096),
@@ -163,8 +161,7 @@ all_scenarios = [
 ]
 
 
-def _setup_kv_and_metadata(scenario: Scenario, mapping: Mapping,
-                           gen_steps: int):
+def _setup_kv(scenario: Scenario, mapping: Mapping, gen_steps: int):
     # Set up KVCacheManager and attn_metadata for MLA
     n_gpu = mapping.world_size
     assert scenario.ctx_len % n_gpu == 0
@@ -207,30 +204,7 @@ def _setup_kv_and_metadata(scenario: Scenario, mapping: Mapping,
         req.state = LlmRequestState.GENERATION_IN_PROGRESS
         req.prompt_len = ctx_len_per_gpu
         req.py_prompt_len = req.prompt_len
-    attn_metadata = get_attention_backend("TRTLLM").Metadata(
-        seq_lens=torch.tensor([ctx_len_per_gpu] * scenario.batch,
-                              dtype=torch.int),
-        request_ids=list(range(scenario.batch)),
-        max_num_requests=scenario.batch,
-        num_contexts=scenario.batch,
-        prompt_lens=[ctx_len_per_gpu] * scenario.batch,
-        max_num_tokens=ctx_len_per_gpu,
-        kv_cache_manager=kv_cache_manager,
-        kv_cache_params=KVCacheParams(
-            use_cache=True,
-            num_cached_tokens_per_seq=[0 for _ in range(scenario.batch)],
-        ),
-        mapping=mapping,
-        enable_paged_context_mla=True,
-        runtime_features=AttentionRuntimeFeatures(
-            chunked_prefill=True,
-            cache_reuse=True,
-            has_speculative_draft_tokens=False,
-            chunk_size=8192,
-        ),
-    )
-    attn_metadata.prepare()
-    return kv_cache_manager, attn_metadata
+    return kv_cache_manager
 
 
 def _generate_random_weights(layer: DeepseekV3DecoderLayer):
@@ -406,10 +380,6 @@ def _copy_to_cp(weights, param_name, dim, rank, world_size):
 def _run_ds_layer_distributed(rank: int, world_size: int, scenario: Scenario,
                               gen_steps: int):
     torch.manual_seed(42 + rank)
-    input_ctx = torch.empty(scenario.batch * scenario.ctx_len,
-                            scenario.hidden_size,
-                            dtype=scenario.dtype,
-                            device="cuda").uniform_(-1, 1)
     input_gen = torch.empty(scenario.batch * scenario.predicted_tokens_per_seq,
                             scenario.hidden_size,
                             dtype=scenario.dtype,
@@ -419,9 +389,6 @@ def _run_ds_layer_distributed(rank: int, world_size: int, scenario: Scenario,
                                      scenario.hidden_size,
                                      dtype=scenario.dtype,
                                      device="cuda").uniform_(-1, 1)
-    position_ids_ctx = torch.arange(scenario.ctx_len,
-                                    dtype=torch.int,
-                                    device="cuda").repeat(scenario.batch)
     position_ids_gen = torch.full((scenario.batch, ),
                                   scenario.ctx_len,
                                   dtype=torch.int,
@@ -493,7 +460,6 @@ def _run_ds_layer_distributed(rank: int, world_size: int, scenario: Scenario,
             moe_backend="TRTLLM",
             use_cuda_graph=True,
         )
-    config.quant_config.exclude_modules.append("*fused_a*")
     if rank == 0:
         print(f"Rank 0 using config: {config}")
     else:
@@ -516,35 +482,10 @@ def _run_ds_layer_distributed(rank: int, world_size: int, scenario: Scenario,
     _generate_random_weights(layer)
 
     # Set up KVCacheManager and attn_metadata for distributed
-    kv_cache_manager, attn_metadata = _setup_kv_and_metadata(
-        scenario, mapping, gen_steps)
-    extra_attrs["attention_metadata"] = weakref.ref(attn_metadata)
+    kv_cache_manager = _setup_kv(scenario, mapping, gen_steps)
+    # just explicitly generate KV cache values
+    kv_cache_manager.get_buffers(0).uniform_(-1, 1)
     ctx_len_per_gpu = scenario.ctx_len // world_size
-    input_ctx_bs = input_ctx.view(scenario.batch, scenario.ctx_len,
-                                  scenario.hidden_size)
-
-    # split inputs into chunks for each rank
-    input_ctx_bs_rank = input_ctx_bs[:, rank * ctx_len_per_gpu:(rank + 1) *
-                                     ctx_len_per_gpu, :]
-    input_ctx_rank = input_ctx_bs_rank.reshape(
-        scenario.batch * ctx_len_per_gpu, scenario.hidden_size).contiguous()
-    position_ids_ctx_bs = position_ids_ctx.view(scenario.batch,
-                                                scenario.ctx_len)
-    position_ids_ctx_bs_rank = position_ids_ctx_bs[:, rank *
-                                                   ctx_len_per_gpu:(rank + 1) *
-                                                   ctx_len_per_gpu]
-    position_ids_ctx_rank = position_ids_ctx_bs_rank.reshape(
-        scenario.batch * ctx_len_per_gpu).contiguous()
-    # this represents the context step
-    with model_extra_attrs(extra_attrs):
-        # note: only run the attention because MoE causes some issues with large #tokens
-        layer.self_attn(
-            position_ids=position_ids_ctx_rank,
-            hidden_states=input_ctx_rank,
-            attn_metadata=attn_metadata,
-            all_reduce_params=AllReduceParams(
-                enable_allreduce=not (layer.disable_attn_allreduce)),
-        )
 
     outputs = []
     start = time.time()
