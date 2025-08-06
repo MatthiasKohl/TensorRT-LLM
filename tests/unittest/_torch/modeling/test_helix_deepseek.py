@@ -19,7 +19,8 @@ from mpi4py.futures import MPIPoolExecutor
 from transformers import PretrainedConfig
 
 import tensorrt_llm
-from tensorrt_llm._torch.attention_backend.interface import KVCacheParams
+from tensorrt_llm._torch.attention_backend.interface import (
+    AttentionRuntimeFeatures, KVCacheParams)
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.distributed import AllReduceParams
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -131,17 +132,17 @@ class ScenarioV3(Scenario):
 
 
 all_scenarios = [
-    Scenario(batch=1, ctx_len=1024),
-    Scenario(batch=1, ctx_len=2048),
-    Scenario(batch=1, ctx_len=4096),
-    Scenario(batch=1, ctx_len=8192),
-    Scenario(batch=1, ctx_len=16384),
-    Scenario(batch=1, ctx_len=32768),
-    Scenario(batch=1, ctx_len=65536),
-    Scenario(batch=1, ctx_len=131072),
-    Scenario(batch=1, ctx_len=262144),
-    Scenario(batch=1, ctx_len=524288),
-    Scenario(batch=1, ctx_len=1048576),
+    ScenarioV3(batch=1, ctx_len=1024),
+    ScenarioV3(batch=1, ctx_len=2048),
+    ScenarioV3(batch=1, ctx_len=4096),
+    ScenarioV3(batch=1, ctx_len=8192),
+    ScenarioV3(batch=1, ctx_len=16384),
+    ScenarioV3(batch=1, ctx_len=32768),
+    ScenarioV3(batch=1, ctx_len=65536),
+    ScenarioV3(batch=1, ctx_len=131072),
+    ScenarioV3(batch=1, ctx_len=262144),
+    ScenarioV3(batch=1, ctx_len=524288),
+    ScenarioV3(batch=1, ctx_len=1048576),
     Scenario(batch=8, ctx_len=1024),
     Scenario(batch=8, ctx_len=2048),
     Scenario(batch=8, ctx_len=4096),
@@ -220,6 +221,13 @@ def _setup_kv_and_metadata(scenario: Scenario, mapping: Mapping,
             num_cached_tokens_per_seq=[0 for _ in range(scenario.batch)],
         ),
         mapping=mapping,
+        enable_paged_context_mla=True,
+        runtime_features=AttentionRuntimeFeatures(
+            chunked_prefill=True,
+            cache_reuse=True,
+            has_speculative_draft_tokens=False,
+            chunk_size=8192,
+        ),
     )
     attn_metadata.prepare()
     return kv_cache_manager, attn_metadata
@@ -485,6 +493,7 @@ def _run_ds_layer_distributed(rank: int, world_size: int, scenario: Scenario,
             moe_backend="TRTLLM",
             use_cuda_graph=True,
         )
+    config.quant_config.exclude_modules.append("*fused_a*")
     if rank == 0:
         print(f"Rank 0 using config: {config}")
     else:
