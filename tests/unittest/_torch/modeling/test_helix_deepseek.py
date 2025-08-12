@@ -102,7 +102,8 @@ class Scenario:
     ctx_len: int = 1024
     # note: this is essentially the warm-up steps, as there is no correctness check for now
     ref_steps: int = 1
-    world_size: int = 2
+    tp_size: int = 2
+    world_size: int = 8
 
     @property
     def max_position_embeddings(self) -> int:
@@ -163,7 +164,7 @@ all_scenarios = [
 
 def _setup_kv(scenario: Scenario, mapping: Mapping, gen_steps: int):
     # Set up KVCacheManager and attn_metadata for MLA
-    n_gpu = mapping.world_size
+    n_gpu = mapping.cp_size
     assert scenario.ctx_len % n_gpu == 0
     ctx_len_per_gpu = scenario.ctx_len // n_gpu
     max_tokens = (
@@ -367,15 +368,6 @@ def _generate_random_weights(layer: DeepseekV3DecoderLayer):
                 init_linear(shared_experts.down_proj)
 
 
-def _copy_to_cp(weights, param_name, dim, rank, world_size):
-    w_dim_per_rank = weights[param_name].shape[dim] // world_size
-    w_dim_start = rank * w_dim_per_rank
-    w_dim_end = w_dim_start + w_dim_per_rank
-    slices = [slice(None)] * weights[param_name].ndim
-    slices[dim] = slice(w_dim_start, w_dim_end)
-    weights[param_name] = weights[param_name][slices]
-
-
 @torch.inference_mode
 def _run_ds_layer_distributed(rank: int, world_size: int, scenario: Scenario,
                               gen_steps: int):
@@ -445,7 +437,8 @@ def _run_ds_layer_distributed(rank: int, world_size: int, scenario: Scenario,
     mapping = Mapping(world_size=world_size,
                       rank=rank,
                       moe_ep_size=(world_size + 3) // 4,
-                      cp_size=world_size,
+                      tp_size=scenario.tp_size,
+                      cp_size=world_size // scenario.tp_size,
                       cp_config={'cp_type': CpType.HELIX})
     with tempfile.TemporaryDirectory() as tmpdir:
         config_dict = pretrained_config.to_dict()
@@ -485,7 +478,7 @@ def _run_ds_layer_distributed(rank: int, world_size: int, scenario: Scenario,
     kv_cache_manager = _setup_kv(scenario, mapping, gen_steps)
     # just explicitly generate KV cache values
     kv_cache_manager.get_buffers(0).uniform_(-1, 1)
-    ctx_len_per_gpu = scenario.ctx_len // world_size
+    ctx_len_per_gpu = scenario.ctx_len // mapping.cp_size
 
     outputs = []
     start = time.time()
@@ -499,7 +492,7 @@ def _run_ds_layer_distributed(rank: int, world_size: int, scenario: Scenario,
     for step in range(gen_steps):
         for req_id in range(scenario.batch):
             kv_cache_manager.impl.add_token(req_id)
-        cache_add = step if rank == world_size - 1 else 0
+        cache_add = step if rank == mapping.cp_size - 1 else 0
         cached_tokens_per_seq = [
             ctx_len_per_gpu + cache_add for _ in range(scenario.batch)
         ]
