@@ -504,3 +504,7 @@ def _register_fake():
         return router_logits.new_empty(
             sz, dtype=torch.int32), router_logits.new_empty(sz,
                                                             dtype=output_dtype)
+
+    @torch.library.register_fake("trtllm::helix_post_process")
+    def _(gathered_o, gathered_stats, scale):
+        return gathered_o.new_empty(*gathered_o.shape[1:])
