@@ -12,7 +12,7 @@ from tensorrt_llm.mapping import Mapping
 from ..attention_backend import (AttentionInputType, AttentionMetadata,
                                  FlashInferAttentionMetadata, TrtllmAttention,
                                  TrtllmAttentionMetadata)
-from ..attention_backend.interface import (AttentionMask,
+from ..attention_backend.interface import (AttentionBackend, AttentionMask,
                                            PositionalEmbeddingParams,
                                            PredefinedAttentionMask)
 from ..attention_backend.utils import create_attention, get_attention_backend
@@ -998,14 +998,19 @@ class MLA(nn.Module):
             # similar to the post-processing of ring attention
             kv_lora_rank = partial_o.shape[-1] // self.num_heads_tp
             assert self.kv_lora_rank == kv_lora_rank
-            # note: if num_heads_tp is a multiple of cp_size, which is asserted
-            # in initialization, then chunk will split the tensors correctly.
+            chunks_o = [
+                t.contiguous() for t in torch.split(partial_o,
+                                                    partial_o.shape[-1] //
+                                                    self.mapping.cp_size,
+                                                    dim=-1)
+            ]
+            chunks_stats = [
+                t.contiguous() for t in torch.split(softmax_stats,
+                                                    softmax_stats.shape[1] //
+                                                    self.mapping.cp_size,
+                                                    dim=1)
+            ]
             # TODO we should check in alltoall_helix that the tensors are contiguous
-            chunks_o = torch.chunk(
-                partial_o.transpose(0, -1).contiguous(), self.mapping.cp_size)
-            chunks_stats = torch.chunk(
-                softmax_stats.transpose(0, 1).contiguous(),
-                self.mapping.cp_size)
             gathered_o, gathered_stats = alltoall_helix(
                 chunks_o + chunks_stats,
                 self.mapping.cp_group,
@@ -1501,8 +1506,10 @@ class MLA(nn.Module):
             latent_cache=latent_cache,  # kvcache and k_pe
             q_pe=q_pe,  # used by `invokeMLARopeGeneration`
         )
+        print(
+            f"q: {fused_q[0, :8]}, attn out: {attn_out_latent[0, :8]} / {attn_out_latent[0, self.num_heads_tp_cp * self.kv_lora_rank // 2:self.num_heads_tp_cp * self.kv_lora_rank // 2 + 8]}"
+        )
         fused_q = None
-
         # note: if we do not have CP, then num_heads_tp_cp == num_heads_tp
         assert (attn_out_latent.shape[0] == q.shape[0]
                 and attn_out_latent.shape[1]
