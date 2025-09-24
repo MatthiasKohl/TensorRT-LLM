@@ -16,7 +16,7 @@ from ..attention_backend.interface import (AttentionBackend, AttentionMask,
                                            PositionalEmbeddingParams,
                                            PredefinedAttentionMask)
 from ..attention_backend.utils import create_attention, get_attention_backend
-from ..distributed import AllReduceParams, alltoall_helix
+from ..distributed import AllReduceParams, alltoall
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
@@ -998,22 +998,24 @@ class MLA(nn.Module):
             # similar to the post-processing of ring attention
             kv_lora_rank = partial_o.shape[-1] // self.num_heads_tp
             assert self.kv_lora_rank == kv_lora_rank
-            chunks_o = [
-                t.contiguous() for t in torch.split(partial_o,
-                                                    partial_o.shape[-1] //
-                                                    self.mapping.cp_size,
-                                                    dim=-1)
-            ]
-            chunks_stats = [
-                t.contiguous() for t in torch.split(softmax_stats,
-                                                    softmax_stats.shape[1] //
-                                                    self.mapping.cp_size,
-                                                    dim=1)
-            ]
+            # chunks_o = [
+            #     t.contiguous() for t in torch.split(partial_o,
+            #                                         partial_o.shape[-1] //
+            #                                         self.mapping.cp_size,
+            #                                         dim=-1)
+            # ]
+            # chunks_stats = [
+            #     t.contiguous() for t in torch.split(softmax_stats,
+            #                                         softmax_stats.shape[1] //
+            #                                         self.mapping.cp_size,
+            #                                         dim=1)
+            # ]
             # TODO we should check in alltoall_helix that the tensors are contiguous
-            gathered_o, gathered_stats = alltoall_helix(
-                chunks_o + chunks_stats,
+            gathered_o, gathered_stats = alltoall(
+                [partial_o, softmax_stats],
                 self.mapping.cp_group,
+                dims=[-1, 1],
+                new_dims=[0, 0],
             )
             return torch.ops.trtllm.helix_post_process(gathered_o,
                                                        gathered_stats, 1.0)
