@@ -190,7 +190,6 @@ class TrtllmAttentionWrapper:
         spec_decoding_generation_lengths: Optional[torch.Tensor] = None,
         attention_sinks: Optional[torch.Tensor] = None,
         chunked_prefill_buffer_batch_size: int = 1,
-        helix_position_offsets: Optional[torch.Tensor] = None,
         **kwargs,
     ):
         """
@@ -230,7 +229,6 @@ class TrtllmAttentionWrapper:
             helix_position_offsets (torch.Tensor): The tensor to store the helix position offsets, with shape (num_tokens) on GPU.
             attention_sinks (torch.Tensor): The attention sinks (additional value in the denominator of the softmax) with shape of (num_heads_q) on GPU.
             chunked_prefill_buffer_batch_size (int): used for malloc buffer for k and v in fp8 context mla. the max input kv length is not max_num_tokens in this case. It is chunked_prefill_buffer_batch_size * max_num_tokens.
-            helix_position_offsets (torch.Tensor): The tensor to store the helix position offsets, with shape (num_tokens) on GPU.
         """
         self.layer_idx = layer_idx
         self.tokens_per_block = tokens_per_block
@@ -268,7 +266,6 @@ class TrtllmAttentionWrapper:
         self.softmax_stats_tensor = softmax_stats_tensor
         self.helix_position_offsets = helix_position_offsets
         self.attention_sinks = attention_sinks
-        self.helix_position_offsets = helix_position_offsets
 
         if max_sequence_length > self.rope_params.max_positions:
             self.rope_params.max_positions = max_sequence_length
@@ -494,7 +491,6 @@ class TrtllmAttentionWrapper:
             self.softmax_stats_tensor,
             spec_decoding_bool_params,
             spec_decoding_tensor_params,
-            self.helix_position_offsets
         )
         # reset the planned states (especially tensors) to avoid memory leak
         self.plan()
@@ -1227,7 +1223,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         softmax_stats_tensor: Optional[torch.Tensor] = None,
         helix_position_offsets: Optional[torch.Tensor] = None,
         enable_attn_nvfp4_output: bool = True,
-        helix_position_offsets: Optional[torch.Tensor] = None,
         output: Optional[torch.Tensor] = None,
         output_sf: Optional[torch.Tensor] = None,
         attention_sinks: Optional[torch.Tensor] = None,
@@ -1308,7 +1303,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             spec_decoding_generation_lengths,
             attention_sinks=attention_sinks,
             chunked_prefill_buffer_batch_size=chunked_prefill_buffer_batch_size,
-            helix_position_offsets=helix_position_offsets,
         )
         out_dtype = None
         if out_scale is not None:
