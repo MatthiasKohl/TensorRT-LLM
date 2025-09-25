@@ -998,21 +998,15 @@ class MLA(nn.Module):
             # similar to the post-processing of ring attention
             kv_lora_rank = partial_o.shape[-1] // self.num_heads_tp
             assert self.kv_lora_rank == kv_lora_rank
-            chunks_o = [
-                t.contiguous() for t in torch.split(partial_o,
-                                                    partial_o.shape[-1] //
-                                                    self.mapping.cp_size,
-                                                    dim=-1)
-            ]
-            chunks_stats = [
-                t.contiguous() for t in torch.split(softmax_stats,
-                                                    softmax_stats.shape[1] //
-                                                    self.mapping.cp_size,
-                                                    dim=1)
-            ]
-            # TODO we should check in alltoall_helix that the tensors are contiguous
+            chunks_o = torch.split(partial_o,
+                                   self.num_heads_tp_cp * kv_lora_rank,
+                                   dim=-1)
+            chunks_stats = torch.split(softmax_stats,
+                                       self.num_heads_tp_cp,
+                                       dim=1)
+            all_chunks = [t.contiguous() for t in chunks_o + chunks_stats]
             gathered_o, gathered_stats = alltoall_helix(
-                chunks_o + chunks_stats,
+                all_chunks,
                 self.mapping.cp_group,
             )
             return torch.ops.trtllm.helix_post_process(gathered_o,

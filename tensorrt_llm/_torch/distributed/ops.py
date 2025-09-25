@@ -263,6 +263,8 @@ def alltoall_helix(
         ref_input = inputs[il * n_ranks]
         assert all([inputs[i].shape == ref_input.shape for i in range(il * n_ranks + 1, (il + 1) * n_ranks)]),\
             "all input tensors in a group must have the same shape"
+    assert all(t.is_contiguous() for t in inputs),\
+        "all input tensors must be contiguous"
 
     return torch.ops.trtllm.alltoall_helix(inputs, group, num_lists)
 
