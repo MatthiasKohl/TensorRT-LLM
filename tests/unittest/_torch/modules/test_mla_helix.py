@@ -17,7 +17,7 @@ import tensorrt_llm
 from tensorrt_llm._torch.attention_backend.interface import (
     AttentionMetadata, KVCacheParams, PositionalEmbeddingParams, RopeParams)
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
-from tensorrt_llm._torch.distributed.ops import allgather
+from tensorrt_llm._torch.distributed.ops import cp_allgather
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.attention import MLA
 from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest,
@@ -143,35 +143,6 @@ class RopeConfig:
     rope_theta: float = 10000.0
     qk_rope_head_dim: int = 64
     model_type: str = "deepseek_v3"
-
-
-class CpToTpMapping(Mapping):
-    # this is a bridge class which switches CP and TP ranks/groups in a mapping
-    # for allgather and similar ops
-    # Note that this is not a fully functional mapping and should only be used
-    # for distributed ops
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.tp_size, self.cp_size = self.cp_size, self.tp_size
-        self.attn_tp_size, self.attn_cp_size = self.attn_cp_size, self.attn_tp_size
-
-    @property
-    def cp_rank(self):
-        return 0 if self.auto_parallel else self.rank % self.tp_size
-
-    @property
-    def tp_rank(self):
-        return 0 if self.auto_parallel else self.rank % (
-            self.tp_size * self.cp_size) // self.tp_size
-
-    @property
-    def cp_group(self):
-        return self.tp_groups[self.pp_rank * self.cp_size + self.cp_rank]
-
-    @property
-    def tp_group(self):
-        return self.cp_groups[self.pp_rank * self.tp_size + self.tp_rank]
 
 
 def _setup_kv_and_metadata(scenario: Scenario, mapping: Mapping,
@@ -432,12 +403,12 @@ def _make_latent_cache_gen(mla: MLA, rank: int, world_size: int,
         ret = input_ctx_bs.new_empty((world_size - 1, input_ctx_bs.shape[0],
                                       mla.kv_lora_rank + mla.qk_rope_head_dim))
 
-    mapping = CpToTpMapping(world_size=world_size,
-                            rank=rank,
-                            cp_size=world_size,
-                            cp_config={'cp_type': CpType.HELIX})
+    mapping = Mapping(world_size=world_size,
+                      rank=rank,
+                      cp_size=world_size,
+                      cp_config={'cp_type': CpType.HELIX})
     # use allgather here to broadcast from rank 0 to all other ranks
-    ret_all = allgather(ret, mapping=mapping, dim=0)
+    ret_all = cp_allgather(ret, mapping=mapping, dim=0)
     ret = ret_all.view(world_size, *ret.shape)[0]
     if rank == world_size - 1:
         return None
@@ -800,21 +771,17 @@ def _full_test_multi_gpu(rank: int, world_size: int, scenario: Scenario,
                                  device="cuda")
         ref_attn_metadata = None
 
-    # we use allgather here because there is no broadcast op across CP group
-    mapping = CpToTpMapping(world_size=world_size,
-                            rank=rank,
-                            cp_size=world_size,
-                            cp_config={'cp_type': CpType.HELIX})
-    ref_output_all = allgather(ref_output, mapping=mapping, dim=0)
-    # we only need the values from rank 0
-    ref_output = ref_output_all.view(world_size, *ref_output.shape)[0]
-    test_params = (input_ctx, input_gen, position_ids_ctx, weights,
-                   pos_embd_params, ref_attn_metadata)
     # Distributed mapping for helix
     mapping = Mapping(world_size=world_size,
                       rank=rank,
                       cp_size=world_size,
                       cp_config={'cp_type': CpType.HELIX})
+    # we use cp_allgather here because there is no broadcast op across CP group
+    ref_output_all = cp_allgather(ref_output, mapping=mapping, dim=0)
+    # we only need the values from rank 0
+    ref_output = ref_output_all.view(world_size, *ref_output.shape)[0]
+    test_params = (input_ctx, input_gen, position_ids_ctx, weights,
+                   pos_embd_params, ref_attn_metadata)
     return _run_mla_distributed(rank, world_size, scenario, mapping,
                                 test_params, ref_output, gen_steps)
 
