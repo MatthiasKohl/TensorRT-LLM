@@ -7,7 +7,7 @@ from torch import nn
 
 from tensorrt_llm._utils import get_sm_version, is_sm_100f
 from tensorrt_llm.logger import logger
-from tensorrt_llm.mapping import Mapping, CpType
+from tensorrt_llm.mapping import CpType, Mapping
 
 from ..attention_backend import (AttentionInputType, AttentionMetadata,
                                  FlashInferAttentionMetadata, TrtllmAttention,
@@ -1505,6 +1505,15 @@ class MLA(nn.Module):
             latent_cache=latent_cache,  # kvcache and k_pe
             q_pe=q_pe,  # used by `invokeMLARopeGeneration`
         )
+        if self.layer_idx <= 1 or (self.layer_idx >= 28
+                                   and self.layer_idx < 30):
+            print(
+                f"[Attention::forward_generation][rank {self.mapping.rank}] "
+                f"fused_q: {fused_q[:, :8]} / "
+                f"{fused_q[:, (fused_q.shape[1] // 2):(fused_q.shape[1] // 2 + 8)]}, "
+                f"attn_out_latent: {attn_out_latent[:, :8]} "
+                f"/ {attn_out_latent[:, (attn_out_latent.shape[1] // 2):(attn_out_latent.shape[1] // 2 + 8)]}"
+            )
         fused_q = None
 
         # note: if we do not have CP, then num_heads_tp_cp == num_heads_tp
