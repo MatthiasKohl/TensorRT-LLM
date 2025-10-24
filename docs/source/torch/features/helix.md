@@ -1,7 +1,7 @@
 # Helix Parallelism
 
-For more details, see the following paper describing Helix Parallelism:
-[Helix Parallelism link TODO](https://todo).
+For more details, see the following article describing Helix Parallelism:
+[Helix Parallelism: Rethinking Sharding Strategies for Interactive Multi-Million-Token LLM Decoding](https://arxiv.org/pdf/2507.07120).
 
 Helix parallelism is a type of context / KV cache parallelism.
 Unlike most other types of context parallelism (e.g. star attention or ring attention),
@@ -33,16 +33,32 @@ The scripts to help with this can be found in the
 [slurm/benchmark](../../../../examples/disaggregated/slurm/benchmark) folder,
 found under the disaggregated examples folder.
 
-TODO: note the following section should be updated with more generic scripts
-(not just for OCI HSG cluster).
-
 The main entry script for benchmarking is
 [submit_mjoux.sh](../../../../examples/disaggregated/slurm/benchmark/submit_mjoux.sh).
+
+Many variables specific to the cluster must be set in 
+[submit_mjoux_env.sh](../../../../examples/disaggregated/slurm/benchmark/submit_mjoux_env.sh),
+and this script must be sourced before submitting a run:
+
+- `CONTAINER_IMAGE` : set to the image (e.g. nvcr.io/nvidia/tensorrt-llm/release:1.1.0rc2.post2),
+   or a local path to a `.sqsh` file. The local path is recommended, and can be
+   generated as per below.
+- `CONTAINER_MOUNTS` : required to give the container access to the repo and output directories
+- `WORK_DIR` : full path to the directory of the submit scripts
+- `MODEL_DIR` : full path to the directory of the model used for benchmarking
+- `REPO_DIR` : full path to the base repo directory
+- `DATA_DIR` : full path to the data directory, where the input benchmarking prompts are saved.
+   This directory can be empty, in which case the inputs are automatically downloaded.
+- `SLURM_PARTITION` : the SLURM partition used for the job
+- `SLURM_ACCOUNT` : the SLURM account used for the job
+- `SLURM_JOB_NAME` : the base SLURM job name, the final job name is extended with additional parameters
 
 This script requires the right container image to run, which can be obtained in
 two ways:
 
-1. Set the `repo_dir` variable in the script as expected, as well as `build_wheel=true`.
+1. Use a base TensorRT-LLM image (e.g. nvcr.io/nvidia/tensorrt-llm/release:1.1.0rc2.post2),
+   set the `repo_dir` variable in the script as expected to a path on the cluster
+   with this git repo, as well as `build_wheel=true`.
    This will build the right image before starting the remaining job.
 2. Edit the install job in
    [disaggr_torch.slurm](../../../../examples/disaggregated/slurm/benchmark/disaggr_torch.slurm)
@@ -76,6 +92,22 @@ TP size is `(gen_tp_size * gen_cp_size) / gen_ep_size`.
 
 The benchmark outputs statistics about the generation given the input parameters,
 including throughput and latency numbers, such as time per output token (TPOT).
+
+### End-to-end integration test
+
+An end-to-end integration test, which checks correctness for a few real prompts,
+can be found in
+[test_disaggregated.py](../../../../tests/integration/defs/disaggregated/test_disaggregated.py).
+
+These integration tests are part of the TensorRT-LLM test suite and can be launched
+using `pytest`.
+
+For example, to run a small test using DeepSeek-V3-Lite with FP8, use the following command,
+from the root of this repo:
+
+```bash
+pytest tests/integration/defs/disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_tllm_gen_helix
+```
 
 ### Benchmarking a single layer
 
