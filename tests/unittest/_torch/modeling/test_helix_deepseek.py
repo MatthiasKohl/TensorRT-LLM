@@ -51,6 +51,10 @@ MPI.pickle.__init__(
 )
 
 
+def align_up(value: int, alignment: int) -> int:
+    return ((value + alignment - 1) // alignment) * alignment
+
+
 def llm_models_root(check=False) -> Optional[Path]:
     root = Path("/home/scratch.trt_llm_data/llm-models/")
 
@@ -237,11 +241,23 @@ def parse_args():
     parser.add_argument('--dense',
                         action='store_true',
                         help='Use dense layer instead of MoE layer')
+    parser.add_argument('--quant',
+                        type=str,
+                        default="nvfp4",
+                        choices=["none", "nvfp4", "dsfp8"],
+                        help='Quantization type')
     return parser.parse_args()
 
 
 def generate_scenarios(args):
     """Generate scenarios based on command line arguments."""
+    global QUANTIZATION_TYPE
+    if args.quant == "nvfp4":
+        QUANTIZATION_TYPE = "nvfp4"
+    elif args.quant == "dsfp8":
+        QUANTIZATION_TYPE = "dsfp8"
+    else:
+        QUANTIZATION_TYPE = None
     scenarios = []
     scenario_class = ScenarioV3 if args.type == 'v3' else Scenario
     first_k_dense_replace = 1 if args.dense else 0
@@ -683,6 +699,8 @@ def _run_ds_layer_distributed(rank: int, world_size: int, scenario: Scenario,
             )
         attn_metadata.prepare()
         extra_attrs["attention_metadata"] = weakref.ref(attn_metadata)
+        if step == max(0, gen_steps - 3):
+            torch.cuda.cudart().cudaProfilerStart()
         if not use_cuda_graph:
             # Original non-graph execution
             with model_extra_attrs(extra_attrs):
@@ -744,6 +762,8 @@ def _run_ds_layer_distributed(rank: int, world_size: int, scenario: Scenario,
         # Collect outputs for reference comparison
         if step < scenario.ref_steps:
             outputs.append(result)
+
+    torch.cuda.cudart().cudaProfilerStop()
 
     # synchronize to ensure all graphs are done
     end_event.record()
