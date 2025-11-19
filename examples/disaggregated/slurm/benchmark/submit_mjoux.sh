@@ -7,7 +7,6 @@ if [[ -z "$SLURM_PARTITION" || \
      -z "$CONTAINER_MOUNTS" || \
      -z "$WORK_DIR" || \
      -z "$MODEL_DIR" || \
-     -z "$REPO_DIR" || \
      -z "$DATA_DIR" ]]; then
   echo "Environment not set, please source submit_mjoux_env.sh first"
   exit 1
@@ -17,11 +16,12 @@ ctx_tp_size=8
 ctx_pp_size=1
 ctx_cp_size=1
 ctx_chunked_prefill=false
-gen_tp_size=1
+gen_tp_size=64
 gen_pp_size=1
-gen_cp_size=4
-gen_ep_size=2
-batch=1
+gen_cp_size=1
+gen_ep_size=8
+batch=64
+enable_attention_dp=true
 
 partition=$SLURM_PARTITION
 account=$SLURM_ACCOUNT
@@ -37,11 +37,11 @@ ntasks_per_node=4 # 4 GPUs per GB200 node
 
 isl=1048576
 osl=1024
-concurrency=$((batch * 16))
+concurrency=$((batch * 2))
 multi_round=1
 streaming=true
 benchmark_mode=e2e
-build_wheel=true
+build_wheel=false
 cuda_architectures="100a-real"
 ctx_max_tokens=$((batch * (isl + 10)))
 gen_max_tokens=$((batch * (1 + 10)))
@@ -60,9 +60,9 @@ echo "Calling sbatch with TP $gen_tp_size, CP $gen_cp_size, EP $gen_ep_size, ISL
 
 args=(
     # Context - [num_instances, tp_size, pp_size, cp_size, batch_size, max_num_tokens, enable_attention_dp, gpu_memory_fraction]
-    1 $ctx_tp_size $ctx_pp_size $ctx_cp_size $batch $ctx_max_tokens false "0.85"
+    1 $ctx_tp_size $ctx_pp_size $ctx_cp_size $batch $ctx_max_tokens $enable_attention_dp "0.85"
     # Generation - [num_instances, tp_size, pp_size, cp_size, batch_size, max_num_tokens, enable_attention_dp, gpu_memory_fraction]
-    1 $gen_tp_size $gen_pp_size $gen_cp_size $batch $gen_max_tokens false "0.85"
+    1 $gen_tp_size $gen_pp_size $gen_cp_size $batch $gen_max_tokens $enable_attention_dp "0.85"
     # Other arguments - [eplb_num_slots, mtp_size]
     0 0
     # Benchmarking arguments

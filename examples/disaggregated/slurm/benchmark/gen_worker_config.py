@@ -64,7 +64,7 @@ def gen_config_file(work_dir: str,
     # | GB200 NVL72 EP>8 | FP8 | N/A (WIP) |
 
     ctx_moe_ep_size = ctx_cp_size * ctx_tp_size
-    assert gen_enable_attention_dp is False, "Let's keep it simple for now."
+    # assert gen_enable_attention_dp is False, "Let's keep it simple for now."
     if 'fp4' in model_path or 'FP4' in model_path:
         if ctx_moe_ep_size <= 8:
             ctx_moe_backend = "TRTLLM"
@@ -120,6 +120,7 @@ def gen_config_file(work_dir: str,
     # Assert that gen_batch_size is a power of 2.
     assert gen_batch_size > 0 and (gen_batch_size & (gen_batch_size - 1)) == 0, \
         f"gen_batch_size ({gen_batch_size}) must be a power of 2."
+    local_batch_size = gen_batch_size // gen_tp_size if gen_enable_attention_dp else gen_batch_size
 
     gen_config = {
         'build_config': {
@@ -137,7 +138,7 @@ def gen_config_file(work_dir: str,
         'max_seq_len': gen_max_seq_len,
         'cuda_graph_config': {
             'enable_padding': True,
-            'batch_sizes': [gen_batch_size],
+            'batch_sizes': [local_batch_size],
         },
         'print_iter_log': True,
         'kv_cache_config': {
