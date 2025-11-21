@@ -224,13 +224,6 @@ public:
                 v_ptr = static_cast<T*>(v->slice(0, token_offset).data_ptr());
                 mla_params.k_buf = k_ptr;
                 mla_params.v_buf = v_ptr;
-
-                // For generation, helix position is in ropeOp
-                auto& mla_helix_position_offsets = mla_tensor_params[0];
-                if (mla_helix_position_offsets.has_value())
-                {
-                    mla_params.helix_position_offsets = mla_helix_position_offsets->data_ptr<int32_t>();
-                }
             }
             else
             {
@@ -270,6 +263,13 @@ public:
             mla_params.meta = op.mMLAParams;
 
             mla_params.workspace = workspace_ptr;
+
+            // For generation, helix position is in ropeOp
+            auto& mla_helix_position_offsets = mla_tensor_params[0];
+            if (mla_helix_position_offsets.has_value())
+            {
+                mla_params.helix_position_offsets = mla_helix_position_offsets->data_ptr<int32_t>();
+            }
         }
 
         int const* context_lengths_ptr = context_lengths.slice(0, seq_offset).data_ptr<int>();

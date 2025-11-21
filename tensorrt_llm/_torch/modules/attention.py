@@ -1044,6 +1044,16 @@ class MLA(nn.Module):
                           k: torch.Tensor, v: torch.Tensor,
                           position_ids: Optional[torch.Tensor],
                           attn_metadata: AttentionMetadata, **kwargs):
+        print(
+            f"Rank {self.mapping.rank}/{self.mapping.world_size}-GPU: {attn_metadata.kv_cache_manager.get_buffers(0).shape} {position_ids.shape}, {position_ids[:4]} / {position_ids[-4:]}"
+        )
+        idx = 2048
+        block_idx = idx // attn_metadata.kv_cache_manager.tokens_per_block
+        local_idx = idx % attn_metadata.kv_cache_manager.tokens_per_block
+        kv_values = attn_metadata.kv_cache_manager.get_buffers(0)[0, 0, 0, 0, :]
+        kv_values2 = attn_metadata.kv_cache_manager.get_buffers(0)[block_idx, 0,
+                                                                   local_idx,
+                                                                   0, :]
         if self.mapping.cp_size > 1:
             # partial_o: [num_tokens, num_heads_tp * kv_lora_rank]
             # softmax_stats: [num_tokens, num_heads_tp, 2]
@@ -1058,6 +1068,14 @@ class MLA(nn.Module):
                 softmax_stats_tensor=softmax_stats,
                 helix_position_offsets=position_ids,
                 **kwargs)
+            sub_head_dim = partial_o.shape[-1] // self.mapping.cp_size
+            print(
+                f"Rank {self.mapping.rank}/{self.mapping.world_size}-GPU: "
+                f"q: {q[0, :4]}/{q[0, -4:]}, kv: {kv_values[:4]}/{kv_values[-4:]} / "
+                f"{kv_values2[:4]}/{kv_values2[-4:]}, "
+                f"softmax_stats: {softmax_stats[0, 0]}, "
+                f"partial_o: {partial_o[0, :4]}/{partial_o[0, sub_head_dim:sub_head_dim+4]}"
+            )
             # this is the post-processing of helix parallel attention,
             # similar to the post-processing of ring attention
             kv_lora_rank = partial_o.shape[-1] // self.num_heads_tp
@@ -1078,10 +1096,22 @@ class MLA(nn.Module):
                 chunks_o + chunks_stats,
                 self.mapping.cp_group,
             )
-            return torch.ops.trtllm.helix_post_process(gathered_o,
-                                                       gathered_stats, 1.0)
+            x = torch.ops.trtllm.helix_post_process(gathered_o, gathered_stats,
+                                                    1.0)
+            print(
+                f"Rank {self.mapping.rank}/{self.mapping.world_size}-GPU: "
+                f"helix_post_process: {x[0, :4]}/{x[0, sub_head_dim:sub_head_dim+4]}"
+            )
+            return x
         else:
             attn_output = attn_backend.forward(q, k, v, attn_metadata, **kwargs)
+            sub_head_dim = attn_output.shape[-1] // 2
+            print(
+                f"Rank {self.mapping.rank}/{self.mapping.world_size}-GPU: "
+                f"q: {q[0, :4]}/{q[0, -4:]}, kv:{kv_values[:4]}/{kv_values[-4:]}, "
+                f"{kv_values2[:4]}/{kv_values2[-4:]}, "
+                f"attn_output: {attn_output[0, :4]}/{attn_output[0, sub_head_dim:sub_head_dim+4]}"
+            )
             return attn_output
 
     def create_output(self, hidden_states: torch.Tensor, num_contexts: int):
@@ -1658,6 +1688,9 @@ class MLA(nn.Module):
         num_tokens = q.shape[0]
         q_nope, q_pe = q.view([-1, self.num_heads_tp, self.qk_head_dim]).split(
             [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        print(
+            f"Rank {self.mapping.rank}/{self.mapping.world_size}-GPU: {q_nope.shape} {q_pe.shape}, {q_nope[0, 0, :4]} / {q_nope[0, 0, -4:]} / {q_pe[0, 0, :4]} / {q_pe[0, 0, -4:]}"
+        )
 
         # fused_q contains 1) the result of the following bmm with shape [num_tokens, num_heads, kv_lora_rank]
         # 2) rope(q_pe) with shape [num_tokens, num_heads, qk_rope_head_dim]. rope is applied inside AttentionOp
